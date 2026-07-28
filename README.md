@@ -10,6 +10,7 @@ This revision is aligned with the current Zn(His)2 project directory tree.
 - Independent Packmol seeds are stored in each `manifest.json`.
 - The full droplet is centered at its center of mass before applying the xTB wall.
 - The xTB wall radius is based on the actual outermost atom after centering.
+- A short solvent-only GFN2-xTB pre-relaxation precedes MD by default.
 - MD logs are checked for explicit instability/emergency-exit patterns.
 - `xtb-trj.pdb` is archived when generated.
 - Output root defaults to `md_screening/`.
@@ -60,6 +61,7 @@ For every replica inspect:
 md_screening/<SYSTEM>/replica_XX/packing/packed_sphere.pdb
 md_screening/<SYSTEM>/replica_XX/system_centered.pdb
 md_screening/<SYSTEM>/replica_XX/manifest.json
+md_screening/<SYSTEM>/replica_XX/00_relax.inp
 ```
 
 ## Run after inspection
@@ -69,6 +71,32 @@ python3 xtb_md_pipeline.py --main --threads 8 --run
 ```
 
 Completed stages are skipped on later invocations unless `--force` is used.
+
+The workflow is:
+
+```text
+Packmol spherical droplet
+  -> solvent-only GFN2-xTB pre-relaxation
+  -> 100 K
+  -> 200 K
+  -> 298 K equilibration
+  -> 298 K screening
+```
+
+During `00_relax`, all atoms belonging to Zn(His)2 are fixed and only the
+explicit water molecules can move. The atom range is derived from the
+unsolvated solute PDB and validated against the beginning of Packmol's output.
+This removes artificial contacts and strain from initial packing without
+allowing a zero-temperature optimization to change the coordination state that
+the MD is intended to test. The same spherical log-Fermi wall used by MD remains
+active. Defaults are `--opt loose`, 30 cycles, and no ALPB.
+
+To reproduce the earlier workflow and start directly from
+`system_centered.pdb`, use:
+
+```bash
+python3 xtb_md_pipeline.py --system O6_I --skip-relax --run
+```
 
 ## Run only one system
 
@@ -127,12 +155,18 @@ md_screening/
     │   │   ├── packmol.out
     │   │   └── packed_sphere.pdb
     │   ├── system_centered.pdb
+    │   ├── system_relaxed.pdb
     │   ├── manifest.json
+    │   ├── 00_relax.inp
     │   ├── 01_100K.inp
     │   ├── 02_200K.inp
     │   ├── 03_298K_equil.inp
     │   ├── 04_298K_screen.inp
     │   └── stages/
+    │       └── 00_relax/
+    │           ├── 00_relax.out
+    │           ├── xtbopt.*
+    │           └── stage.done
     └── replica_02/
 ```
 
@@ -140,6 +174,7 @@ md_screening/
 
 Per replica:
 
+- solvent-only pre-relaxation, loose, at most 30 cycles
 - 100 K, 0.5 ps
 - 200 K, 0.5 ps
 - 298.15 K equilibration, 1.0 ps

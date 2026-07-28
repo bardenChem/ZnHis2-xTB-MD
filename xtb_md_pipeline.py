@@ -10,7 +10,8 @@ Current scope
 2. Creates TWO independent replicas by default.
 3. For each replica, builds a spherical explicit-water droplet with Packmol.
 4. Centers the packed droplet at its total center of mass.
-5. Creates xTB MD inputs for:
+5. Creates a solvent-only xTB pre-relaxation input and xTB MD inputs for:
+      00_relax       short optimization with Zn(His)2 fixed
       01_100K        0.5 ps
       02_200K        0.5 ps
       03_298K_equil  1.0 ps
@@ -34,6 +35,7 @@ older Packmol versions that do not support the newer `pbc` keyword.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -137,6 +139,13 @@ FATAL_MD_PATTERNS = [
     "floating point exception",
 ]
 
+FATAL_XTB_PATTERNS = [
+    "emergency exit",
+    "Runtime exception",
+    "segmentation fault",
+    "floating point exception",
+]
+
 
 # ---------------------------------------------------------------------------
 # PDB helpers
@@ -199,6 +208,123 @@ def read_pdb_atoms(lines: Iterable[str]):
         raise ValueError("No ATOM/HETATM records found in PDB.")
 
     return atoms
+
+
+def pdb_atoms(path: Path):
+    """Read PDB atoms while retaining template line information."""
+    return read_pdb_atoms(path.read_text().splitlines(keepends=True))
+
+
+def validate_packed_solute(solute_pdb: Path, packed_pdb: Path):
+    """Validate Packmol's documented solute-first atom ordering."""
+    solute = pdb_atoms(solute_pdb)
+    packed = pdb_atoms(packed_pdb)
+    n_solute = len(solute)
+
+    if len(packed) <= n_solute:
+        raise ValueError(
+            f"Packed system must contain solvent: found {len(packed)} total "
+            f"atoms and {n_solute} solute atoms in {packed_pdb}."
+        )
+
+    expected = [atom["element"] for atom in solute]
+    observed = [atom["element"] for atom in packed[:n_solute]]
+    if observed != expected:
+        mismatch = next(
+            i for i, (a, b) in enumerate(zip(expected, observed), start=1)
+            if a != b
+        )
+        raise ValueError(
+            "Packed PDB solute-first validation failed at atom "
+            f"{mismatch}: expected {expected[mismatch - 1]}, found "
+            f"{observed[mismatch - 1]}. Refusing to freeze possibly wrong atoms."
+        )
+
+    return n_solute, len(packed)
+
+
+def replace_pdb_coordinates(
+    template_pdb: Path,
+    coordinates,
+    output_pdb: Path,
+    elements=None,
+):
+    """Write coordinates into a PDB template, preserving atom metadata/order."""
+    lines = template_pdb.read_text().splitlines(keepends=True)
+    atoms = read_pdb_atoms(lines)
+    coordinates = list(coordinates)
+
+    if len(coordinates) != len(atoms):
+        raise ValueError(
+            f"Geometry has {len(coordinates)} atoms; expected {len(atoms)}."
+        )
+    if elements is not None:
+        normalized = [
+            value[0].upper() + value[1:].lower() for value in elements
+        ]
+        expected = [atom["element"] for atom in atoms]
+        if normalized != expected:
+            raise ValueError(
+                "Optimized geometry element sequence differs from PDB template."
+            )
+
+    atom_by_line = {
+        atom["line_index"]: xyz for atom, xyz in zip(atoms, coordinates)
+    }
+    output = []
+    for index, line in enumerate(lines):
+        if index not in atom_by_line:
+            output.append(line)
+            continue
+        x, y, z = atom_by_line[index]
+        core = line.rstrip("\r\n").ljust(54)
+        output.append(
+            core[:30] + f"{x:8.3f}{y:8.3f}{z:8.3f}" + core[54:] + "\n"
+        )
+    output_pdb.write_text("".join(output))
+
+
+def read_xyz_geometry(path: Path):
+    lines = path.read_text(errors="replace").splitlines()
+    try:
+        n_atoms = int(lines[0].strip())
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"Invalid XYZ atom count in {path}.") from exc
+    if len(lines) < n_atoms + 2:
+        raise ValueError(f"Incomplete XYZ geometry in {path}.")
+
+    elements, coordinates = [], []
+    for line in lines[2:n_atoms + 2]:
+        fields = line.split()
+        if len(fields) < 4:
+            raise ValueError(f"Invalid XYZ atom record in {path}: {line}")
+        elements.append(fields[0])
+        coordinates.append(tuple(float(value) for value in fields[1:4]))
+    return elements, coordinates
+
+
+def read_coord_geometry(path: Path):
+    """Read an xTB/Turbomole coord file (coordinates are in bohr)."""
+    lines = path.read_text(errors="replace").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "$coord")
+    except StopIteration as exc:
+        raise ValueError(f"No $coord section in {path}.") from exc
+
+    elements, coordinates = [], []
+    for line in lines[start + 1:]:
+        if line.lstrip().startswith("$"):
+            break
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        coordinates.append(
+            tuple(float(value) / BOHR_PER_ANGSTROM for value in fields[:3])
+        )
+        elements.append(fields[3])
+    if not coordinates:
+        raise ValueError(f"No atoms in $coord section of {path}.")
+    return elements, coordinates
 
 
 def pdb_molar_mass(pdb: Path) -> float:
@@ -475,6 +601,18 @@ $end
 """
 
 
+def relax_input(n_solute_atoms: int, wall_radius_bohr: float) -> str:
+    return f"""$fix
+   atoms: 1-{n_solute_atoms}
+$end
+
+$wall
+   potential=logfermi
+   sphere: {wall_radius_bohr:.3f}, all
+$end
+"""
+
+
 def write_manifest(
     replica_dir: Path,
     system_name: str,
@@ -486,8 +624,19 @@ def write_manifest(
     packmol_seed: int,
     geom_info: dict,
     wall_radius_A: float,
+    n_solute_atoms: int,
     args,
 ):
+    manifest_path = replica_dir / "manifest.json"
+    previous_result = None
+    if manifest_path.exists():
+        try:
+            previous_result = json.loads(
+                manifest_path.read_text()
+            ).get("relaxation_result")
+        except (OSError, json.JSONDecodeError):
+            pass
+
     data = {
         "workflow_stage": "E2_screening",
         "system": system_name,
@@ -512,6 +661,24 @@ def write_manifest(
             "original_center_of_mass_A": geom_info["original_center_of_mass_A"],
             "new_center_of_mass_A": [0.0, 0.0, 0.0],
             "max_radius_from_COM_A": geom_info["max_radius_from_COM_A"],
+        },
+        "relaxation": {
+            "enabled": not args.skip_relax,
+            "mode": "solvent_only",
+            "solute_fixed": not args.skip_relax,
+            "fixed_atoms": (
+                f"1-{n_solute_atoms}" if not args.skip_relax else None
+            ),
+            "n_solute_atoms": n_solute_atoms,
+            "n_mobile_atoms": geom_info["n_atoms"] - n_solute_atoms,
+            "gfn": args.gfn,
+            "optimization_level": args.relax_level,
+            "max_cycles": args.relax_cycles,
+            "wall_type": "logfermi_sphere",
+            "input_geometry": "system_centered.pdb",
+            "output_geometry": (
+                "system_relaxed.pdb" if not args.skip_relax else None
+            ),
         },
         "wall": {
             "type": "logfermi_sphere",
@@ -539,10 +706,14 @@ def write_manifest(
             "Do not interpret E2 state frequencies as converged equilibrium populations."
         ),
     }
+    if (
+        previous_result is not None
+        and (stage_archive_dir(replica_dir, "00_relax") / "stage.done").exists()
+        and not args.force
+    ):
+        data["relaxation_result"] = previous_result
 
-    (replica_dir / "manifest.json").write_text(
-        json.dumps(data, indent=2)
-    )
+    manifest_path.write_text(json.dumps(data, indent=2))
 
 
 def prepare_replica(
@@ -572,6 +743,11 @@ def prepare_replica(
 
     centered_pdb = replica_dir / "system_centered.pdb"
     geom_info = center_pdb(packed_pdb, centered_pdb)
+    n_solute_atoms, n_total_atoms = validate_packed_solute(
+        solute_pdb, centered_pdb
+    )
+    if n_total_atoms != geom_info["n_atoms"]:
+        raise RuntimeError("Internal atom-count mismatch after centering.")
 
     # The wall follows the ACTUAL centered droplet, not just the requested
     # Packmol radius. This avoids putting initial atoms inside the wall.
@@ -579,6 +755,10 @@ def prepare_replica(
         geom_info["max_radius_from_COM_A"] + args.wall_margin
     )
     wall_radius_bohr = wall_radius_A * BOHR_PER_ANGSTROM
+
+    (replica_dir / "00_relax.inp").write_text(
+        relax_input(n_solute_atoms, wall_radius_bohr)
+    )
 
     for stage in STAGES:
         (replica_dir / f"{stage['name']}.inp").write_text(
@@ -596,6 +776,7 @@ def prepare_replica(
         packmol_seed=packmol_seed,
         geom_info=geom_info,
         wall_radius_A=wall_radius_A,
+        n_solute_atoms=n_solute_atoms,
         args=args,
     )
 
@@ -605,6 +786,7 @@ def prepare_replica(
     print(f"  waters             : {nwater}")
     print(f"  Packmol seed       : {packmol_seed}")
     print(f"  atoms total        : {geom_info['n_atoms']}")
+    print(f"  solute atoms       : {n_solute_atoms}")
     print(
         "  original COM (A)   : "
         + " ".join(
@@ -622,21 +804,158 @@ def prepare_replica(
     return replica_dir
 
 
-def xtb_command(args, input_name: str):
+def xtb_command(
+    args,
+    geometry_name: str,
+    input_name: str,
+    *,
+    optimize: bool = False,
+):
     cmd = [
         args.xtb,
-        "system_centered.pdb",
+        geometry_name,
         "--gfn", str(args.gfn),
         "--chrg", str(args.charge),
         "--uhf", str(args.uhf),
-        "--md",
-        "--input", input_name,
     ]
+    if optimize:
+        cmd += [
+            "--opt", args.relax_level,
+            "--cycles", str(args.relax_cycles),
+        ]
+    else:
+        cmd.append("--md")
+    cmd += ["--input", input_name]
 
     if args.alpb:
         cmd += ["--alpb", args.alpb]
 
     return cmd
+
+
+def update_manifest(replica_dir: Path, key: str, value):
+    path = replica_dir / "manifest.json"
+    data = json.loads(path.read_text())
+    data[key] = value
+    path.write_text(json.dumps(data, indent=2))
+
+
+def valid_pdb(path: Path, expected_atoms: int) -> bool:
+    try:
+        return path.exists() and len(pdb_atoms(path)) == expected_atoms
+    except (OSError, ValueError):
+        return False
+
+
+def materialize_relaxed_pdb(replica_dir: Path, expected_atoms: int) -> Path:
+    """Find xTB's optimized geometry and create the operational relaxed PDB."""
+    template = replica_dir / "system_centered.pdb"
+    destination = replica_dir / "system_relaxed.pdb"
+
+    for name in ["xtbopt.pdb", "xtblast.pdb"]:
+        candidate = replica_dir / name
+        if valid_pdb(candidate, expected_atoms):
+            candidate_atoms = pdb_atoms(candidate)
+            template_elements = [a["element"] for a in pdb_atoms(template)]
+            if [a["element"] for a in candidate_atoms] != template_elements:
+                raise RuntimeError(
+                    f"{name} element sequence differs from input."
+                )
+            shutil.copy2(candidate, destination)
+            return destination
+
+    errors = []
+    for name, reader in [
+        ("xtbopt.xyz", read_xyz_geometry),
+        ("xtbopt.coord", read_coord_geometry),
+        ("xtblast.xyz", read_xyz_geometry),
+        ("xtblast.coord", read_coord_geometry),
+    ]:
+        candidate = replica_dir / name
+        if not candidate.exists():
+            continue
+        try:
+            elements, coordinates = reader(candidate)
+            if len(coordinates) != expected_atoms:
+                raise ValueError(
+                    f"found {len(coordinates)} atoms, expected {expected_atoms}"
+                )
+            replace_pdb_coordinates(
+                template, coordinates, destination, elements=elements
+            )
+            return destination
+        except (OSError, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
+
+    detail = (
+        "; ".join(errors)
+        if errors
+        else "no xtbopt/xtblast PDB, XYZ, or coord geometry found"
+    )
+    raise RuntimeError(f"No valid final relaxation geometry: {detail}.")
+
+
+def solute_displacement(
+    initial_pdb: Path,
+    relaxed_pdb: Path,
+    n_solute_atoms: int,
+):
+    initial = pdb_atoms(initial_pdb)[:n_solute_atoms]
+    relaxed = pdb_atoms(relaxed_pdb)[:n_solute_atoms]
+    displacements = [
+        math.dist(a["xyz"], b["xyz"]) for a, b in zip(initial, relaxed)
+    ]
+    return {
+        "solute_rmsd_A": math.sqrt(
+            sum(value * value for value in displacements) / len(displacements)
+        ),
+        "solute_max_displacement_A": max(displacements),
+    }
+
+
+def relaxation_diagnostics(log_path: Path, not_converged: bool):
+    """Return conservative diagnostics; avoid guessing xTB-version log formats."""
+    text = log_path.read_text(errors="replace")
+    lowered = text.lower()
+    for pattern in FATAL_XTB_PATTERNS:
+        if pattern.lower() in lowered:
+            raise RuntimeError(
+                f"Fatal xTB pattern detected: '{pattern}'. See {log_path}"
+            )
+
+    cycle_numbers = [
+        int(value) for value in re.findall(
+            r"^\s*cycle\s+(\d+)\b", text, flags=re.IGNORECASE | re.MULTILINE
+        )
+    ]
+    converged = None
+    if "geometry optimization converged" in lowered:
+        converged = True
+    elif not_converged:
+        converged = False
+    return {
+        "converged": converged,
+        "cycles": max(cycle_numbers) if cycle_numbers else None,
+        "initial_energy_Eh": None,
+        "final_energy_Eh": None,
+        "delta_energy_Eh": None,
+    }
+
+
+def relaxation_signature(replica_dir: Path, manifest: dict, args) -> dict:
+    """Inputs that must match before a completed relaxation can be reused."""
+    centered = replica_dir / "system_centered.pdb"
+    return {
+        "input_sha256": hashlib.sha256(centered.read_bytes()).hexdigest(),
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "optimization_level": args.relax_level,
+        "max_cycles": args.relax_cycles,
+        "wall_radius_bohr": manifest["wall"]["radius_bohr"],
+        "fixed_atoms": manifest["relaxation"]["fixed_atoms"],
+    }
 
 
 def stage_archive_dir(replica_dir: Path, stage_name: str) -> Path:
@@ -732,11 +1051,141 @@ def archive_stage_outputs(
     (archive / "stage.done").write_text("ok\n")
 
 
+def run_relaxation(replica_dir: Path, args, env):
+    manifest = json.loads((replica_dir / "manifest.json").read_text())
+    config = manifest["relaxation"]
+    n_solute = config["n_solute_atoms"]
+    n_total = manifest["geometry_after_centering"]["n_atoms"]
+    relaxed_pdb = replica_dir / "system_relaxed.pdb"
+    archive = stage_archive_dir(replica_dir, "00_relax")
+    done = archive / "stage.done"
+    signature = relaxation_signature(replica_dir, manifest, args)
+
+    if done.exists() and not args.force:
+        previous = manifest.get("relaxation_result", {})
+        if previous.get("configuration") != signature:
+            raise RuntimeError(
+                "Completed 00_relax is incompatible with the current geometry "
+                "or settings. Use --force to rebuild it."
+            )
+        if not valid_pdb(relaxed_pdb, n_total):
+            raise RuntimeError(
+                f"{done} exists, but system_relaxed.pdb is absent or invalid. "
+                "Use --force to rebuild 00_relax."
+            )
+        displacement = solute_displacement(
+            replica_dir / "system_centered.pdb", relaxed_pdb, n_solute
+        )
+        if displacement["solute_max_displacement_A"] > 1.0e-3:
+            raise RuntimeError(
+                "Completed relaxation has moved fixed solute atoms by "
+                f"{displacement['solute_max_displacement_A']:.6f} A."
+            )
+        print(
+            f"  SKIP {replica_dir.parent.name}/{replica_dir.name} "
+            "00_relax: already completed"
+        )
+        return
+
+    if relaxed_pdb.exists() and not args.force:
+        raise RuntimeError(
+            f"{relaxed_pdb} exists without a reusable completed stage. "
+            "Refusing to overwrite it; inspect it or use --force."
+        )
+
+    archive.mkdir(parents=True, exist_ok=True)
+    if args.force and done.exists():
+        print(
+            f"  WARNING replacing archived 00_relax outputs for "
+            f"{replica_dir.parent.name}/{replica_dir.name} (--force)"
+        )
+    if args.force and relaxed_pdb.exists():
+        relaxed_pdb.unlink()
+    for name in [
+        "00_relax.out",
+        "xtbopt.pdb", "xtbopt.xyz", "xtbopt.coord", "xtbopt.log",
+        "xtblast.pdb", "xtblast.xyz", "xtblast.coord",
+        "NOT_CONVERGED",
+    ]:
+        path = replica_dir / name
+        if path.exists():
+            path.unlink()
+        archived = archive / name
+        if archived.exists():
+            archived.unlink()
+    if done.exists():
+        done.unlink()
+
+    cmd = xtb_command(
+        args, "system_centered.pdb", "00_relax.inp", optimize=True
+    )
+    log_path = replica_dir / "00_relax.out"
+    print(f"  RELAX {replica_dir.parent.name}/{replica_dir.name}")
+    print(f"       fixed solute atoms  : 1-{n_solute}")
+    print(f"       mobile solvent atoms: {n_solute + 1}-{n_total}")
+    print(f"       optimization level : {args.relax_level}")
+    print(f"       max cycles          : {args.relax_cycles}")
+    print(f"       {' '.join(cmd)}")
+
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            cmd,
+            cwd=replica_dir,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"xTB failed at 00_relax for {replica_dir.parent.name}/"
+            f"{replica_dir.name}. See {log_path}"
+        )
+
+    not_converged = (replica_dir / "NOT_CONVERGED").exists()
+    diagnostics = relaxation_diagnostics(log_path, not_converged)
+    diagnostics["configuration"] = signature
+    materialize_relaxed_pdb(replica_dir, n_total)
+    displacement = solute_displacement(
+        replica_dir / "system_centered.pdb", relaxed_pdb, n_solute
+    )
+    diagnostics.update(displacement)
+    if displacement["solute_max_displacement_A"] > 1.0e-3:
+        raise RuntimeError(
+            "00_relax changed fixed solute coordinates: maximum displacement "
+            f"{displacement['solute_max_displacement_A']:.6f} A exceeds "
+            "the 0.001 A tolerance. MD was not started."
+        )
+
+    shutil.copy2(log_path, archive / "00_relax.out")
+    for name in [
+        "xtbopt.pdb", "xtbopt.xyz", "xtbopt.coord", "xtbopt.log",
+        "xtblast.pdb", "xtblast.xyz", "xtblast.coord",
+        "NOT_CONVERGED",
+    ]:
+        path = replica_dir / name
+        if path.exists():
+            shutil.copy2(path, archive / name)
+    update_manifest(replica_dir, "relaxation_result", diagnostics)
+    done.write_text("ok\n")
+
+    if not_converged:
+        print(
+            "  WARNING 00_relax reached max cycles without full convergence; "
+            "using last valid geometry for MD."
+        )
+    else:
+        print("  OK   00_relax")
+
+
 def run_replica(replica_dir: Path, args):
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.threads)
     env.setdefault("MKL_NUM_THREADS", str(args.threads))
     env.setdefault("OMP_STACKSIZE", "4G")
+
+    if not args.skip_relax:
+        run_relaxation(replica_dir, args, env)
 
     for i, stage in enumerate(STAGES):
         name = stage["name"]
@@ -768,7 +1217,12 @@ def run_replica(replica_dir: Path, args):
 
         input_name = f"{name}.inp"
         log_path = replica_dir / f"{name}.out"
-        cmd = xtb_command(args, input_name)
+        geometry_name = (
+            "system_relaxed.pdb"
+            if i == 0 and not args.skip_relax
+            else "system_centered.pdb"
+        )
+        cmd = xtb_command(args, geometry_name, input_name)
 
         print(
             f"  RUN  {replica_dir.parent.name}/"
@@ -1017,6 +1471,29 @@ def parse_args():
     )
 
     p.add_argument(
+        "--skip-relax",
+        action="store_true",
+        help="Skip solvent-only 00_relax and start MD from system_centered.pdb.",
+    )
+
+    p.add_argument(
+        "--relax-level",
+        default="loose",
+        choices=[
+            "crude", "sloppy", "loose", "normal", "tight",
+            "verytight", "extreme",
+        ],
+        help="xTB optimization level for 00_relax (default: loose).",
+    )
+
+    p.add_argument(
+        "--relax-cycles",
+        type=int,
+        default=30,
+        help="Maximum optimization cycles for 00_relax (default: 30).",
+    )
+
+    p.add_argument(
         "--force",
         action="store_true",
         help="Re-run xTB stages even if stage.done exists.",
@@ -1065,6 +1542,9 @@ def validate_args(args):
 
     if args.wall_margin <= 0:
         raise SystemExit("--wall-margin must be > 0.")
+
+    if args.relax_cycles < 1:
+        raise SystemExit("--relax-cycles must be >= 1.")
 
 
 def main():
@@ -1124,7 +1604,7 @@ def main():
             replica_dirs.append(replica_dir)
 
     if args.run:
-        print("\nStarting xTB MD E2 pipeline...")
+        print("\nStarting xTB relaxation + MD E2 pipeline...")
 
         for replica_dir in replica_dirs:
             run_replica(
