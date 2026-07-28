@@ -1,0 +1,19 @@
+# Zn(His)2 + water; 20 x 20 x 20 A^3
+# XYZ version: use directly with the ZnHis2 XYZ structures.
+# Replace ZnHis2_I_Hudecova2022.xyz by the desired starting structure.
+
+tolerance 2.0
+filetype xyz
+output ZnHis2_I_water_20A.xyz
+
+pbc 20.0 20.0 20.0
+
+structure ZnHis2_I_Hudecova2022.xyz
+  number 1
+  center
+  fixed 10.0 10.0 10.0 0.0 0.0 0.0
+end structure
+
+structure water.xyz
+  number 250
+end structure

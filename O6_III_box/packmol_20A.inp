@@ -1,0 +1,17 @@
+# Zn(His)2 + water; 20 x 20 x 20 A^3
+# PDB version: use directly with the ZnHis2 PBD structures.
+# Replace ZnHis2_III_Hudecova2022.xyz by the desired starting structure.
+
+tolerance 2.0
+output ZnHis2_III_water_20A.pdb
+
+structure ZnHis2_III.pdb
+  number 1
+  center
+  fixed 10.0 10.0 10.0 0.0 0.0 0.0
+end structure
+
+structure water.pdb
+  number 250
+  inside box 1.2 1.2 1.2 18.8 18.8 18.8
+end structure

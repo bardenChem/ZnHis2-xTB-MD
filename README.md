@@ -1,0 +1,156 @@
+# xTB MD pipeline v2 — E2 screening
+
+This revision is aligned with the current Zn(His)2 project directory tree.
+
+## Main changes
+
+- Two independent replicas per system by default.
+- Each replica receives its own Packmol spherical water droplet.
+- Packmol uses classic `inside sphere` syntax, so no `pbc` keyword is required.
+- Independent Packmol seeds are stored in each `manifest.json`.
+- The full droplet is centered at its center of mass before applying the xTB wall.
+- The xTB wall radius is based on the actual outermost atom after centering.
+- MD logs are checked for explicit instability/emergency-exit patterns.
+- `xtb-trj.pdb` is archived when generated.
+- Output root defaults to `md_screening/`.
+
+## Expected source tree
+
+```text
+.
+├── xtb_md_pipeline.py
+├── O6_I_box/
+│   ├── water.pdb
+│   └── ZnHis2_I.pdb
+├── O6_II_box/
+│   └── ZnHis2_II.pdb
+├── O6_III_box/
+│   └── ZnHis2_III.pdb
+├── T4_box_cristal/
+│   └── cristal.pdb
+└── T4_IV_box/
+    └── ZnHis2_IV.pdb
+```
+
+The program finds `water.pdb` automatically from the current project folders.
+You may instead pass `--water-pdb /path/to/water.pdb`.
+
+## Prepare the four main systems
+
+```bash
+python3 xtb_md_pipeline.py --main
+```
+
+Default E2 droplet:
+
+- spherical Packmol droplet;
+- radius = 12 A;
+- water count estimated to give an initial total mass density near 1.0 g/cm3;
+- 2 independent replicas per system;
+- Packmol tolerance = 2 A.
+
+The current Zn(His)2 composition should give roughly ~220 waters for a 12 A droplet.
+The exact value is computed from the actual PDB composition.
+
+## Inspect before MD
+
+For every replica inspect:
+
+```text
+md_screening/<SYSTEM>/replica_XX/packing/packed_sphere.pdb
+md_screening/<SYSTEM>/replica_XX/system_centered.pdb
+md_screening/<SYSTEM>/replica_XX/manifest.json
+```
+
+## Run after inspection
+
+```bash
+python3 xtb_md_pipeline.py --main --threads 8 --run
+```
+
+Completed stages are skipped on later invocations unless `--force` is used.
+
+## Run only one system
+
+```bash
+python3 xtb_md_pipeline.py --system O6_I
+```
+
+Then:
+
+```bash
+python3 xtb_md_pipeline.py --system O6_I --threads 8 --run
+```
+
+## Control structure
+
+```bash
+python3 xtb_md_pipeline.py --controls
+python3 xtb_md_pipeline.py --controls --threads 8 --run
+```
+
+## Override droplet size
+
+Example: 13 A:
+
+```bash
+python3 xtb_md_pipeline.py --main --sphere-radius 13.0
+```
+
+## Override water count
+
+```bash
+python3 xtb_md_pipeline.py --main --waters 220
+```
+
+If `--waters` is supplied, the density-based estimate is disabled.
+
+## Force new Packmol configurations
+
+```bash
+python3 xtb_md_pipeline.py --main --repack
+```
+
+This replaces the existing `packed_sphere.pdb` for the selected replicas.
+Do not do this after starting production runs unless intentionally rebuilding them.
+
+## Output structure
+
+```text
+md_screening/
+└── O6_I/
+    ├── replica_01/
+    │   ├── packing/
+    │   │   ├── solute.pdb
+    │   │   ├── water.pdb
+    │   │   ├── packmol_sphere.inp
+    │   │   ├── packmol.out
+    │   │   └── packed_sphere.pdb
+    │   ├── system_centered.pdb
+    │   ├── manifest.json
+    │   ├── 01_100K.inp
+    │   ├── 02_200K.inp
+    │   ├── 03_298K_equil.inp
+    │   ├── 04_298K_screen.inp
+    │   └── stages/
+    └── replica_02/
+```
+
+## E2 protocol
+
+Per replica:
+
+- 100 K, 0.5 ps
+- 200 K, 0.5 ps
+- 298.15 K equilibration, 1.0 ps
+- 298.15 K screening, 5.0 ps
+
+GFN2-xTB by default, 0.5 fs timestep, physical H masses, SHAKE off.
+
+## Scope boundary
+
+This script is deliberately limited to E2 preparation/screening.
+
+A later analysis-oriented program can consume the stable directory layout and
+control TRAVIS, coordination analysis, clustering and E2->E3/E4 selection without
+mixing simulation execution with analysis logic.

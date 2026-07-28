@@ -1,0 +1,43 @@
+# ============================================================
+# xTB MD generated data
+# ============================================================
+
+md_screening/
+
+*.trj
+xtb-trj.pdb
+mdrestart
+mdrestart_*
+xtbrestart
+xtbmdok
+scoord.*
+charges
+wbo
+xtbtopo.mol
+
+# Runtime/log outputs generated repeatedly
+*.out
+
+# ============================================================
+# Temporary/testing
+# ============================================================
+
+test_xtb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*~
+
+# PyMOL sessions
+*.pse
