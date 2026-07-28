@@ -422,6 +422,56 @@ def sphere_volume_A3(radius_A: float) -> float:
     return (4.0 / 3.0) * math.pi * radius_A ** 3
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def packing_signature(
+    solute_pdb: Path,
+    water_pdb: Path,
+    radius_A: float,
+    nwater: int,
+    tolerance_A: float,
+    seed: int,
+) -> dict:
+    return {
+        "solute_sha256": file_sha256(solute_pdb),
+        "water_sha256": file_sha256(water_pdb),
+        "sphere_radius_A": radius_A,
+        "water_count": nwater,
+        "packmol_tolerance_A": tolerance_A,
+        "packmol_seed": seed,
+    }
+
+
+def validate_packing_provenance(
+    packed_pdb: Path,
+    packing_manifest: Path,
+    expected_signature: dict,
+):
+    if not packing_manifest.exists():
+        raise RuntimeError(
+            f"Existing {packed_pdb} has no provenance metadata. "
+            "Use --repack once to establish a validated packing."
+        )
+    try:
+        recorded = json.loads(packing_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot read packing provenance from {packing_manifest}. "
+            "Use --repack to regenerate it."
+        ) from exc
+    if recorded != expected_signature:
+        raise RuntimeError(
+            "Existing packed_sphere.pdb was generated with different packing "
+            "parameters. Use --repack to regenerate it."
+        )
+
+
 def estimate_water_count(
     solute_pdb: Path,
     radius_A: float,
@@ -506,9 +556,7 @@ def run_packmol(
     packed_pdb = packing_dir / "packed_sphere.pdb"
     packmol_inp = packing_dir / "packmol_sphere.inp"
     packmol_log = packing_dir / "packmol.out"
-
-    shutil.copy2(solute_pdb, solute_local)
-    shutil.copy2(water_pdb, water_local)
+    packing_manifest = packing_dir / "packing_manifest.json"
 
     if args.waters is None:
         nwater = estimate_water_count(
@@ -518,6 +566,24 @@ def run_packmol(
         )
     else:
         nwater = args.waters
+
+    signature = packing_signature(
+        solute_pdb=solute_pdb,
+        water_pdb=water_pdb,
+        radius_A=args.sphere_radius,
+        nwater=nwater,
+        tolerance_A=args.packmol_tolerance,
+        seed=seed,
+    )
+
+    if packed_pdb.exists() and not args.repack:
+        validate_packing_provenance(
+            packed_pdb, packing_manifest, signature
+        )
+        return packed_pdb, nwater, packmol_inp, packmol_log
+
+    shutil.copy2(solute_pdb, solute_local)
+    shutil.copy2(water_pdb, water_local)
 
     inp_text = packmol_input(
         solute_name=solute_local.name,
@@ -530,15 +596,15 @@ def run_packmol(
     )
     packmol_inp.write_text(inp_text)
 
-    if packed_pdb.exists() and not args.repack:
-        return packed_pdb, nwater, packmol_inp, packmol_log
-
     packmol_exe = shutil.which(args.packmol)
     if packmol_exe is None:
         raise RuntimeError(
             f"Packmol executable '{args.packmol}' not found in PATH. "
             "Use --packmol /path/to/packmol if needed."
         )
+
+    if args.repack and packed_pdb.exists():
+        packed_pdb.unlink()
 
     with packmol_inp.open("r") as fin, packmol_log.open("w") as fout:
         result = subprocess.run(
@@ -560,6 +626,8 @@ def run_packmol(
             f"Packmol ended without creating {packed_pdb}. "
             f"See {packmol_log}"
         )
+
+    packing_manifest.write_text(json.dumps(signature, indent=2))
 
     log_text = packmol_log.read_text(errors="replace")
 
@@ -913,33 +981,99 @@ def solute_displacement(
     }
 
 
-def relaxation_diagnostics(log_path: Path, not_converged: bool):
-    """Return conservative diagnostics; avoid guessing xTB-version log formats."""
-    text = log_path.read_text(errors="replace")
+def _last_float(pattern: str, text: str):
+    matches = re.findall(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+    if not matches:
+        return None
+    value = matches[-1]
+    if isinstance(value, tuple):
+        value = next((part for part in value if part), "")
+    try:
+        return float(value.replace("D", "E").replace("d", "e"))
+    except ValueError:
+        return None
+
+
+def parse_relaxation_output(text: str, not_converged_file: bool = False):
+    """Parse only unambiguous final optimization diagnostics."""
     lowered = text.lower()
     for pattern in FATAL_XTB_PATTERNS:
         if pattern.lower() in lowered:
             raise RuntimeError(
-                f"Fatal xTB pattern detected: '{pattern}'. See {log_path}"
+                f"Fatal xTB pattern detected: '{pattern}'."
             )
 
-    cycle_numbers = [
-        int(value) for value in re.findall(
-            r"^\s*cycle\s+(\d+)\b", text, flags=re.IGNORECASE | re.MULTILINE
-        )
-    ]
+    failed = re.search(
+        r"failed\s+to\s+converge\s+geometry\s+optimization"
+        r"(?:\s+in\s+(\d+)\s+cycles?)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    converged_match = re.search(
+        r"geometry\s+optimization\s+converged"
+        r"(?:\s+(?:in|after)\s+(\d+)\s+(?:cycles?|iterations?))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     converged = None
-    if "geometry optimization converged" in lowered:
-        converged = True
-    elif not_converged:
+    cycles = None
+    if failed or not_converged_file:
         converged = False
+        if failed and failed.group(1):
+            cycles = int(failed.group(1))
+    elif converged_match:
+        converged = True
+        if converged_match.group(1):
+            cycles = int(converged_match.group(1))
+
+    if cycles is None:
+        cycle_numbers = [
+            int(value) for value in re.findall(
+                r"^\s*cycle\s+(\d+)\b",
+                text,
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        ]
+        cycles = max(cycle_numbers) if cycle_numbers else None
+
+    number = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)"
+    final_energy = _last_float(
+        rf"^(?![^\n]*\bINITIAL\s+(?:TOTAL\s+)?ENERGY\b)"
+        rf"[^\n]*\bTOTAL\s+ENERGY\s*:?\s*{number}\s*Eh\b",
+        text,
+    )
+    final_gradient = _last_float(
+        rf"\bGRADIENT\s+NORM\s*:?\s*{number}\s*Eh\s*(?:/|per)\s*(?:a0|α)\b",
+        text,
+    )
+    initial_energy = _last_float(
+        rf"\bINITIAL\s+(?:TOTAL\s+)?ENERGY\s*:?\s*{number}\s*Eh\b",
+        text,
+    )
+
     return {
         "converged": converged,
-        "cycles": max(cycle_numbers) if cycle_numbers else None,
-        "initial_energy_Eh": None,
-        "final_energy_Eh": None,
-        "delta_energy_Eh": None,
+        "cycles": cycles,
+        "initial_energy_Eh": initial_energy,
+        "final_energy_Eh": final_energy,
+        "delta_energy_Eh": (
+            final_energy - initial_energy
+            if initial_energy is not None and final_energy is not None
+            else None
+        ),
+        "final_gradient_Eh_a0": final_gradient,
     }
+
+
+def relaxation_diagnostics(log_path: Path, not_converged_file: bool):
+    try:
+        return parse_relaxation_output(
+            log_path.read_text(errors="replace"),
+            not_converged_file=not_converged_file,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"{exc} See {log_path}") from exc
 
 
 def relaxation_signature(replica_dir: Path, manifest: dict, args) -> dict:
@@ -991,23 +1125,18 @@ def restore_restart_from_previous(
     )
 
 
-def check_md_log(log_path: Path):
+def inspect_md_log(log_path: Path):
     text = log_path.read_text(errors="replace")
     lowered = text.lower()
 
+    fatal_patterns = []
     for pattern in FATAL_MD_PATTERNS:
         if pattern.lower() in lowered:
-            raise RuntimeError(
-                f"Fatal MD pattern detected: '{pattern}'. "
-                f"See {log_path}"
-            )
-
-    warnings = []
-
-    if "thermostating problem" in lowered:
-        warnings.append("thermostating problem")
-
-    return warnings
+            fatal_patterns.append(pattern)
+    return {
+        "fatal_patterns": fatal_patterns,
+        "thermostating_problem": "thermostating problem" in lowered,
+    }
 
 
 def archive_stage_outputs(
@@ -1022,6 +1151,7 @@ def archive_stage_outputs(
         "xtb.trj",
         "xtb-trj.pdb",
         "mdrestart",
+        "mdrestart.input",
         "xtbmdok",
     ]
 
@@ -1048,7 +1178,182 @@ def archive_stage_outputs(
                 scoord_dir / src.name,
             )
 
+
+def mark_stage_done(archive: Path):
+    failed = archive / "stage.failed"
+    if failed.exists():
+        failed.unlink()
     (archive / "stage.done").write_text("ok\n")
+
+
+def mark_stage_failed(archive: Path, reason: str):
+    done = archive / "stage.done"
+    if done.exists():
+        done.unlink()
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "stage.failed").write_text(reason.rstrip() + "\n")
+
+
+def md_stage_configuration(
+    replica_dir: Path,
+    stage: dict,
+    geometry_name: str,
+    input_name: str,
+    input_restart_sha256: str | None,
+    args,
+) -> dict:
+    manifest = json.loads((replica_dir / "manifest.json").read_text())
+    return {
+        "stage": stage["name"],
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "threads": args.threads,
+        "temp_K": stage["temp"],
+        "time_ps": stage["time"],
+        "step_fs": 0.5,
+        "dump_fs": 10.0,
+        "hmass": 1,
+        "shake": 0,
+        "sccacc": 1.0,
+        "restart": stage["restart"],
+        "wall_radius_bohr": manifest["wall"]["radius_bohr"],
+        "input_geometry": geometry_name,
+        "input_geometry_sha256": file_sha256(
+            replica_dir / geometry_name
+        ),
+        "xtb_input_sha256": file_sha256(replica_dir / input_name),
+        "input_restart_sha256": input_restart_sha256,
+    }
+
+
+def write_md_stage_manifest(
+    archive: Path,
+    configuration: dict,
+    output_restart_sha256: str,
+):
+    archive.mkdir(parents=True, exist_ok=True)
+    data = dict(configuration)
+    data["output_restart_sha256"] = output_restart_sha256
+    (archive / "stage_manifest.json").write_text(
+        json.dumps(data, indent=2)
+    )
+
+
+def validate_completed_md_stage(
+    archive: Path,
+    expected_configuration: dict,
+):
+    stage_name = expected_configuration["stage"]
+    required = [
+        "stage.done",
+        "mdrestart",
+        "xtb.trj",
+        "xtbmdok",
+        "stage_manifest.json",
+    ]
+    if (archive / "stage.failed").exists():
+        raise RuntimeError(
+            f"Stage {stage_name} has both success and failure markers. "
+            "Inspect the archive and rerun with --force."
+        )
+    missing = [name for name in required if not (archive / name).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Stage {stage_name} is marked done but archived outputs are "
+            f"incomplete (missing: {', '.join(missing)}). Inspect the "
+            "archive and rerun with --force."
+        )
+
+    path = archive / "stage_manifest.json"
+    try:
+        recorded = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Stage {stage_name} has an unreadable stage_manifest.json. "
+            "Inspect the archive and rerun with --force."
+        ) from exc
+
+    mismatched = [
+        key for key, expected in expected_configuration.items()
+        if recorded.get(key) != expected
+    ]
+    if mismatched:
+        raise RuntimeError(
+            f"Completed stage {stage_name} is incompatible with the current "
+            f"MD settings (fields: {', '.join(mismatched)}). "
+            "Use --force to rerun it."
+        )
+
+    archived_restart_hash = file_sha256(archive / "mdrestart")
+    if recorded.get("output_restart_sha256") != archived_restart_hash:
+        raise RuntimeError(
+            f"Stage {stage_name} has an archived mdrestart inconsistent with "
+            "stage_manifest.json. Inspect the archive and rerun with --force."
+        )
+
+
+def validate_output_restart(
+    output_restart: Path,
+    input_restart_sha256: str | None,
+) -> str:
+    if not output_restart.exists():
+        raise RuntimeError("missing mdrestart")
+    output_sha256 = file_sha256(output_restart)
+    if (
+        input_restart_sha256 is not None
+        and output_sha256 == input_restart_sha256
+    ):
+        raise RuntimeError(
+            "output mdrestart is byte-identical to input mdrestart"
+        )
+    return output_sha256
+
+
+def prepare_md_stage_attempt(
+    replica_dir: Path,
+    stage_name: str,
+    force: bool,
+    expected_configuration: dict,
+):
+    archive = stage_archive_dir(replica_dir, stage_name)
+    done = archive / "stage.done"
+    failed = archive / "stage.failed"
+
+    if force:
+        if archive.exists() and any(archive.iterdir()):
+            print(
+                f"  WARNING replacing archived {stage_name} outputs (--force)"
+            )
+            shutil.rmtree(archive)
+        return archive, False
+
+    if done.exists():
+        validate_completed_md_stage(archive, expected_configuration)
+        return archive, True
+    if failed.exists():
+        raise RuntimeError(
+            f"Previous failed stage exists for {stage_name}; inspect "
+            "outputs or rerun with --force."
+        )
+    if archive.exists() and any(archive.iterdir()):
+        raise RuntimeError(
+            f"Incomplete archived outputs exist for {stage_name} without a "
+            "valid status marker; inspect them or rerun with --force."
+        )
+    return archive, False
+
+
+def archive_failed_md_stage(
+    replica_dir: Path,
+    stage_name: str,
+    log_path: Path,
+    reason: str,
+):
+    archive_stage_outputs(replica_dir, stage_name, log_path)
+    archive = stage_archive_dir(replica_dir, stage_name)
+    mark_stage_failed(archive, reason)
 
 
 def run_relaxation(replica_dir: Path, args, env):
@@ -1142,8 +1447,8 @@ def run_relaxation(replica_dir: Path, args, env):
             f"{replica_dir.name}. See {log_path}"
         )
 
-    not_converged = (replica_dir / "NOT_CONVERGED").exists()
-    diagnostics = relaxation_diagnostics(log_path, not_converged)
+    not_converged_file = (replica_dir / "NOT_CONVERGED").exists()
+    diagnostics = relaxation_diagnostics(log_path, not_converged_file)
     diagnostics["configuration"] = signature
     materialize_relaxed_pdb(replica_dir, n_total)
     displacement = solute_displacement(
@@ -1169,10 +1474,10 @@ def run_relaxation(replica_dir: Path, args, env):
     update_manifest(replica_dir, "relaxation_result", diagnostics)
     done.write_text("ok\n")
 
-    if not_converged:
+    if diagnostics["converged"] is False:
         print(
-            "  WARNING 00_relax reached max cycles without full convergence; "
-            "using last valid geometry for MD."
+            "  WARNING 00_relax did not converge fully; using the last valid "
+            "geometry for MD."
         )
     else:
         print("  OK   00_relax")
@@ -1189,39 +1494,74 @@ def run_replica(replica_dir: Path, args):
 
     for i, stage in enumerate(STAGES):
         name = stage["name"]
-        archive = stage_archive_dir(replica_dir, name)
+        input_name = f"{name}.inp"
+        geometry_name = (
+            "system_relaxed.pdb"
+            if i == 0 and not args.skip_relax
+            else "system_centered.pdb"
+        )
+        input_restart_sha256 = None
+        if stage["restart"]:
+            previous_restart = (
+                stage_archive_dir(replica_dir, STAGES[i - 1]["name"])
+                / "mdrestart"
+            )
+            if not previous_restart.exists():
+                raise RuntimeError(
+                    f"Previous restart not found: {previous_restart}. "
+                    "Run/complete the previous stage first."
+                )
+            input_restart_sha256 = file_sha256(previous_restart)
 
-        if (
-            (archive / "stage.done").exists()
-            and not args.force
-        ):
+        stage_configuration = md_stage_configuration(
+            replica_dir=replica_dir,
+            stage=stage,
+            geometry_name=geometry_name,
+            input_name=input_name,
+            input_restart_sha256=input_restart_sha256,
+            args=args,
+        )
+        archive, already_done = prepare_md_stage_attempt(
+            replica_dir,
+            name,
+            args.force,
+            stage_configuration,
+        )
+        if already_done:
             print(
                 f"  SKIP {replica_dir.parent.name}/"
                 f"{replica_dir.name} {name}: already completed"
             )
             continue
 
-        restore_restart_from_previous(
-            replica_dir,
-            i,
-        )
-
         for transient in [
             "xtb.trj",
             "xtb-trj.pdb",
             "xtbmdok",
+            "mdrestart.input",
         ]:
             p = replica_dir / transient
             if p.exists():
                 p.unlink()
 
-        input_name = f"{name}.inp"
-        log_path = replica_dir / f"{name}.out"
-        geometry_name = (
-            "system_relaxed.pdb"
-            if i == 0 and not args.skip_relax
-            else "system_centered.pdb"
+        restore_restart_from_previous(
+            replica_dir,
+            i,
         )
+        if stage["restart"]:
+            restart_path = replica_dir / "mdrestart"
+            copied_input_hash = file_sha256(restart_path)
+            if copied_input_hash != input_restart_sha256:
+                raise RuntimeError(
+                    f"Input mdrestart changed while preparing {name}; "
+                    "refusing to run an inconsistent restart chain."
+                )
+            shutil.copy2(
+                restart_path,
+                replica_dir / "mdrestart.input",
+            )
+
+        log_path = replica_dir / f"{name}.out"
         cmd = xtb_command(args, geometry_name, input_name)
 
         print(
@@ -1240,41 +1580,104 @@ def run_replica(replica_dir: Path, args):
                 text=True,
             )
 
+        validation = inspect_md_log(log_path)
         if result.returncode != 0:
+            archive_failed_md_stage(
+                replica_dir,
+                name,
+                log_path,
+                f"xTB return code {result.returncode}",
+            )
             raise RuntimeError(
                 f"xTB failed at {name} for "
                 f"{replica_dir.parent.name}/{replica_dir.name}. "
-                f"See {log_path}"
+                f"Outputs were archived for inspection. See {log_path}"
             )
 
-        warnings = check_md_log(log_path)
-
-        if not (replica_dir / "mdrestart").exists():
+        if validation["fatal_patterns"]:
+            patterns = ", ".join(validation["fatal_patterns"])
+            archive_failed_md_stage(
+                replica_dir,
+                name,
+                log_path,
+                f"fatal log pattern(s): {patterns}",
+            )
             raise RuntimeError(
-                f"{name} ended without mdrrestart for "
-                f"{replica_dir.parent.name}/{replica_dir.name}. "
-                f"See {log_path}"
+                f"Fatal MD pattern(s) detected at {name}: {patterns}. "
+                "Outputs were archived for inspection."
+            )
+
+        if validation["thermostating_problem"]:
+            archive_failed_md_stage(
+                replica_dir,
+                name,
+                log_path,
+                "thermostating problem",
+            )
+            next_stage = (
+                STAGES[i + 1]["name"]
+                if i + 1 < len(STAGES)
+                else "pipeline completion"
+            )
+            raise RuntimeError(
+                f"{name} completed numerically but xTB reported "
+                "'thermostating problem'. Outputs were archived for "
+                f"inspection. Refusing to continue to {next_stage}."
             )
 
         if not (replica_dir / "xtb.trj").exists():
+            archive_failed_md_stage(
+                replica_dir, name, log_path, "missing xtb.trj"
+            )
             raise RuntimeError(
                 f"{name} ended without xtb.trj for "
                 f"{replica_dir.parent.name}/{replica_dir.name}. "
-                f"See {log_path}"
+                f"Outputs were archived for inspection. See {log_path}"
             )
 
+        restart_path = replica_dir / "mdrestart"
+        try:
+            output_restart_sha256 = validate_output_restart(
+                restart_path,
+                input_restart_sha256,
+            )
+        except RuntimeError as exc:
+            archive_failed_md_stage(
+                replica_dir, name, log_path, str(exc)
+            )
+            if "byte-identical" in str(exc):
+                raise RuntimeError(
+                    f"{name} ended without producing a new mdrestart. "
+                    "The output restart is byte-identical to the input "
+                    "restart. Outputs were archived for inspection."
+                ) from exc
+            raise RuntimeError(
+                f"{name} ended without mdrestart for "
+                f"{replica_dir.parent.name}/{replica_dir.name}. "
+                f"Outputs were archived for inspection. See {log_path}"
+            ) from exc
+
+        if not (replica_dir / "xtbmdok").exists():
+            archive_failed_md_stage(
+                replica_dir, name, log_path, "missing xtbmdok"
+            )
+            raise RuntimeError(
+                f"{name} ended without xtbmdok; refusing to mark the stage "
+                "as complete. Outputs were archived for inspection."
+            )
+
+        write_md_stage_manifest(
+            archive,
+            stage_configuration,
+            output_restart_sha256,
+        )
         archive_stage_outputs(
             replica_dir,
             name,
             log_path,
         )
 
-        if warnings:
-            print(
-                f"  WARNING {name}: "
-                + ", ".join(warnings)
-            )
-
+        mark_stage_done(archive)
         print(f"  OK   {name}")
 
     final_archived = (
@@ -1480,8 +1883,8 @@ def parse_args():
         "--relax-level",
         default="loose",
         choices=[
-            "crude", "sloppy", "loose", "normal", "tight",
-            "verytight", "extreme",
+            "crude", "sloppy", "loose", "lax", "normal", "tight",
+            "vtight", "extreme",
         ],
         help="xTB optimization level for 00_relax (default: loose).",
     )

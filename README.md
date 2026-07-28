@@ -71,6 +71,16 @@ python3 xtb_md_pipeline.py --main --threads 8 --run
 ```
 
 Completed stages are skipped on later invocations unless `--force` is used.
+The `stage.done` marker means that a stage finished and passed all output/log
+validations. If xTB reports `thermostating problem`, the outputs are archived,
+the replica stops for inspection, and no `stage.done` is created. With
+`--force`, the old status marker and archive are explicitly invalidated before
+the new attempt begins.
+For MD, a completed archive must contain `xtb.trj`, `mdrestart`, and `xtbmdok`.
+Restarted stages must replace the input `mdrestart` with a byte-different output.
+Each MD archive records its inputs and restart hashes in `stage_manifest.json`;
+therefore, rerunning an earlier stage can require later stages to be rerun when
+their recorded input-restart hash no longer matches.
 
 The workflow is:
 
@@ -141,6 +151,9 @@ python3 xtb_md_pipeline.py --main --repack
 
 This replaces the existing `packed_sphere.pdb` for the selected replicas.
 Do not do this after starting production runs unless intentionally rebuilding them.
+An existing packing is reused only when `packing/packing_manifest.json` proves
+that its solute, water template, radius, water count, tolerance, and seed match
+the current request. Otherwise the pipeline stops and requires `--repack`.
 
 ## Output structure
 
@@ -153,6 +166,7 @@ md_screening/
     │   │   ├── water.pdb
     │   │   ├── packmol_sphere.inp
     │   │   ├── packmol.out
+    │   │   ├── packing_manifest.json
     │   │   └── packed_sphere.pdb
     │   ├── system_centered.pdb
     │   ├── system_relaxed.pdb
