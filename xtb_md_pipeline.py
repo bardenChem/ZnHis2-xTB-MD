@@ -669,8 +669,20 @@ $end
 """
 
 
-def relax_input(n_solute_atoms: int, wall_radius_bohr: float) -> str:
-    return f"""$fix
+def relax_input(
+    n_solute_atoms: int,
+    wall_radius_bohr: float,
+    optimization_engine: str = "auto",
+) -> str:
+    opt_block = ""
+    if optimization_engine != "auto":
+        opt_block = f"""$opt
+   engine={optimization_engine}
+$end
+
+"""
+
+    return f"""{opt_block}$fix
    atoms: 1-{n_solute_atoms}
 $end
 
@@ -741,6 +753,7 @@ def write_manifest(
             "n_mobile_atoms": geom_info["n_atoms"] - n_solute_atoms,
             "gfn": args.gfn,
             "optimization_level": args.relax_level,
+            "optimization_engine": args.relax_engine,
             "max_cycles": args.relax_cycles,
             "wall_type": "logfermi_sphere",
             "input_geometry": "system_centered.pdb",
@@ -825,7 +838,11 @@ def prepare_replica(
     wall_radius_bohr = wall_radius_A * BOHR_PER_ANGSTROM
 
     (replica_dir / "00_relax.inp").write_text(
-        relax_input(n_solute_atoms, wall_radius_bohr)
+        relax_input(
+            n_solute_atoms,
+            wall_radius_bohr,
+            args.relax_engine,
+        )
     )
 
     for stage in STAGES:
@@ -1086,6 +1103,7 @@ def relaxation_signature(replica_dir: Path, manifest: dict, args) -> dict:
         "uhf": args.uhf,
         "alpb": args.alpb,
         "optimization_level": args.relax_level,
+        "optimization_engine": args.relax_engine,
         "max_cycles": args.relax_cycles,
         "wall_radius_bohr": manifest["wall"]["radius_bohr"],
         "fixed_atoms": manifest["relaxation"]["fixed_atoms"],
@@ -1125,17 +1143,73 @@ def restore_restart_from_previous(
     )
 
 
-def inspect_md_log(log_path: Path):
-    text = log_path.read_text(errors="replace")
+def parse_md_thermal_output(text: str) -> dict:
     lowered = text.lower()
-
     fatal_patterns = []
     for pattern in FATAL_MD_PATTERNS:
         if pattern.lower() in lowered:
             fatal_patterns.append(pattern)
+
+    average_temperature = None
+    average_sections = list(re.finditer(
+        r"average\s+properties",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if average_sections:
+        section = text[average_sections[-1].end():]
+        number = (
+            r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+            r"(?:[EeDd][-+]?\d+)?)"
+        )
+        match = re.search(
+            rf"^\s*(?:\|\s*)?T\s*:\s*{number}\b",
+            section,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if match:
+            try:
+                average_temperature = float(
+                    match.group(1).replace("D", "E").replace("d", "e")
+                )
+            except ValueError:
+                pass
+
     return {
         "fatal_patterns": fatal_patterns,
         "thermostating_problem": "thermostating problem" in lowered,
+        "normal_exit_of_md": "normal exit of md()" in lowered,
+        "average_temperature_K": average_temperature,
+    }
+
+
+def inspect_md_log(log_path: Path):
+    return parse_md_thermal_output(
+        log_path.read_text(errors="replace")
+    )
+
+
+def thermostat_warning_allowed(policy: str, stage_name: str) -> bool:
+    if policy == "allow":
+        return True
+    if policy == "ramp":
+        return stage_name in {"01_100K", "02_200K"}
+    return False
+
+
+def md_thermal_result(
+    stage: dict,
+    validation: dict,
+    policy: str,
+    warning_accepted: bool,
+) -> dict:
+    return {
+        "target_temperature_K": stage["temp"],
+        "average_temperature_K": validation["average_temperature_K"],
+        "thermostating_problem": validation["thermostating_problem"],
+        "thermostat_warning_policy": policy,
+        "warning_accepted": warning_accepted,
+        "normal_exit_of_md": validation["normal_exit_of_md"],
     }
 
 
@@ -1225,6 +1299,7 @@ def md_stage_configuration(
         ),
         "xtb_input_sha256": file_sha256(replica_dir / input_name),
         "input_restart_sha256": input_restart_sha256,
+        "thermostat_warning_policy": args.thermostat_warning_policy,
     }
 
 
@@ -1232,10 +1307,12 @@ def write_md_stage_manifest(
     archive: Path,
     configuration: dict,
     output_restart_sha256: str,
+    thermal_result: dict,
 ):
     archive.mkdir(parents=True, exist_ok=True)
     data = dict(configuration)
     data["output_restart_sha256"] = output_restart_sha256
+    data["thermal_result"] = thermal_result
     (archive / "stage_manifest.json").write_text(
         json.dumps(data, indent=2)
     )
@@ -1292,6 +1369,11 @@ def validate_completed_md_stage(
             f"Stage {stage_name} has an archived mdrestart inconsistent with "
             "stage_manifest.json. Inspect the archive and rerun with --force."
         )
+    if not isinstance(recorded.get("thermal_result"), dict):
+        raise RuntimeError(
+            f"Stage {stage_name} has no valid thermal_result in "
+            "stage_manifest.json. Inspect the archive and rerun with --force."
+        )
 
 
 def validate_output_restart(
@@ -1309,6 +1391,94 @@ def validate_output_restart(
             "output mdrestart is byte-identical to input mdrestart"
         )
     return output_sha256
+
+
+def recover_thermostat_warning_stage(
+    replica_dir: Path,
+    stage: dict,
+    archive: Path,
+    configuration: dict,
+    args,
+) -> bool:
+    failed = archive / "stage.failed"
+    if not args.resume_thermostat_warning or not failed.exists():
+        return False
+
+    stage_name = stage["name"]
+    if (archive / "stage.done").exists():
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archive contains both stage.done "
+            "and stage.failed."
+        )
+    reason = failed.read_text(errors="replace").strip()
+    if reason.lower() != "thermostating problem":
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: stage.failed reason is "
+            f"'{reason}', not 'thermostating problem'."
+        )
+    if not thermostat_warning_allowed(
+        args.thermostat_warning_policy,
+        stage_name,
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: thermostat warning policy "
+            f"'{args.thermostat_warning_policy}' does not accept this stage."
+        )
+
+    required = ["xtb.trj", "mdrestart", "xtbmdok", f"{stage_name}.out"]
+    if stage["restart"]:
+        required.append("mdrestart.input")
+    missing = [name for name in required if not (archive / name).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived outputs are incomplete "
+            f"(missing: {', '.join(missing)})."
+        )
+
+    log_path = archive / f"{stage_name}.out"
+    validation = inspect_md_log(log_path)
+    if validation["fatal_patterns"]:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived log contains fatal "
+            f"pattern(s): {', '.join(validation['fatal_patterns'])}."
+        )
+    if not validation["thermostating_problem"]:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived log does not contain "
+            "'thermostating problem'."
+        )
+
+    input_restart_sha256 = configuration["input_restart_sha256"]
+    if stage["restart"]:
+        archived_input_hash = file_sha256(archive / "mdrestart.input")
+        if archived_input_hash != input_restart_sha256:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived input restart does "
+                "not match the currently valid previous stage."
+            )
+
+    output_restart_sha256 = validate_output_restart(
+        archive / "mdrestart",
+        input_restart_sha256,
+    )
+    thermal_result = md_thermal_result(
+        stage,
+        validation,
+        args.thermostat_warning_policy,
+        warning_accepted=True,
+    )
+    write_md_stage_manifest(
+        archive,
+        configuration,
+        output_restart_sha256,
+        thermal_result,
+    )
+    mark_stage_done(archive)
+    print(
+        f"  RECOVER {stage_name}: archived stage had thermostat warning "
+        "only; outputs passed integrity checks and current policy accepts it."
+    )
+    return True
 
 
 def prepare_md_stage_attempt(
@@ -1368,7 +1538,16 @@ def run_relaxation(replica_dir: Path, args, env):
 
     if done.exists() and not args.force:
         previous = manifest.get("relaxation_result", {})
-        if previous.get("configuration") != signature:
+        previous_configuration = dict(
+            previous.get("configuration", {})
+        )
+        # Results produced before --relax-engine existed necessarily used
+        # xTB's default engine selection, i.e. the current "auto" mode.
+        if "optimization_engine" not in previous_configuration:
+            previous_configuration["optimization_engine"] = "auto"
+            previous["configuration"] = previous_configuration
+            update_manifest(replica_dir, "relaxation_result", previous)
+        if previous_configuration != signature:
             raise RuntimeError(
                 "Completed 00_relax is incompatible with the current geometry "
                 "or settings. Use --force to rebuild it."
@@ -1429,6 +1608,7 @@ def run_relaxation(replica_dir: Path, args, env):
     print(f"       fixed solute atoms  : 1-{n_solute}")
     print(f"       mobile solvent atoms: {n_solute + 1}-{n_total}")
     print(f"       optimization level : {args.relax_level}")
+    print(f"       optimization engine: {args.relax_engine}")
     print(f"       max cycles          : {args.relax_cycles}")
     print(f"       {' '.join(cmd)}")
 
@@ -1489,6 +1669,18 @@ def run_replica(replica_dir: Path, args):
     env.setdefault("MKL_NUM_THREADS", str(args.threads))
     env.setdefault("OMP_STACKSIZE", "4G")
 
+    if (
+        args.resume_thermostat_warning
+        and not args.skip_relax
+        and not (
+            stage_archive_dir(replica_dir, "00_relax") / "stage.done"
+        ).exists()
+    ):
+        raise RuntimeError(
+            "--resume-thermostat-warning will not execute 00_relax. "
+            "A completed reusable 00_relax stage is required."
+        )
+
     if not args.skip_relax:
         run_relaxation(replica_dir, args, env)
 
@@ -1521,6 +1713,16 @@ def run_replica(replica_dir: Path, args):
             input_restart_sha256=input_restart_sha256,
             args=args,
         )
+        archive = stage_archive_dir(replica_dir, name)
+        if recover_thermostat_warning_stage(
+            replica_dir,
+            stage,
+            archive,
+            stage_configuration,
+            args,
+        ):
+            continue
+
         archive, already_done = prepare_md_stage_attempt(
             replica_dir,
             name,
@@ -1607,7 +1809,17 @@ def run_replica(replica_dir: Path, args):
                 "Outputs were archived for inspection."
             )
 
-        if validation["thermostating_problem"]:
+        warning_accepted = (
+            validation["thermostating_problem"]
+            and thermostat_warning_allowed(
+                args.thermostat_warning_policy,
+                name,
+            )
+        )
+        if (
+            validation["thermostating_problem"]
+            and not warning_accepted
+        ):
             archive_failed_md_stage(
                 replica_dir,
                 name,
@@ -1622,7 +1834,8 @@ def run_replica(replica_dir: Path, args):
             raise RuntimeError(
                 f"{name} completed numerically but xTB reported "
                 "'thermostating problem'. Outputs were archived for "
-                f"inspection. Refusing to continue to {next_stage}."
+                f"inspection. Policy '{args.thermostat_warning_policy}' "
+                f"refuses to continue to {next_stage}."
             )
 
         if not (replica_dir / "xtb.trj").exists():
@@ -1666,10 +1879,17 @@ def run_replica(replica_dir: Path, args):
                 "as complete. Outputs were archived for inspection."
             )
 
+        thermal_result = md_thermal_result(
+            stage,
+            validation,
+            args.thermostat_warning_policy,
+            warning_accepted,
+        )
         write_md_stage_manifest(
             archive,
             stage_configuration,
             output_restart_sha256,
+            thermal_result,
         )
         archive_stage_outputs(
             replica_dir,
@@ -1678,7 +1898,20 @@ def run_replica(replica_dir: Path, args):
         )
 
         mark_stage_done(archive)
-        print(f"  OK   {name}")
+        if warning_accepted:
+            next_stage = (
+                STAGES[i + 1]["name"]
+                if i + 1 < len(STAGES)
+                else "pipeline completion"
+            )
+            print(
+                f"  WARNING {name}: xTB reported 'thermostating problem'; "
+                "stage completed numerically and passed output-integrity "
+                f"checks. Policy '{args.thermostat_warning_policy}' accepts "
+                f"it; continuing to {next_stage}."
+            )
+        else:
+            print(f"  OK   {name}")
 
     final_archived = (
         stage_archive_dir(
@@ -1897,6 +2130,35 @@ def parse_args():
     )
 
     p.add_argument(
+        "--relax-engine",
+        default="auto",
+        choices=["auto", "rf", "lbfgs", "inertial"],
+        help=(
+            "Optimization engine for 00_relax; inertial selects native xTB "
+            "FIRE (default: auto)."
+        ),
+    )
+
+    p.add_argument(
+        "--thermostat-warning-policy",
+        default="ramp",
+        choices=["strict", "ramp", "allow"],
+        help=(
+            "Policy for xTB 'thermostating problem' warnings "
+            "(default: ramp)."
+        ),
+    )
+
+    p.add_argument(
+        "--resume-thermostat-warning",
+        action="store_true",
+        help=(
+            "Promote archived thermostat-warning-only failed MD stages when "
+            "their outputs and the current policy permit reuse."
+        ),
+    )
+
+    p.add_argument(
         "--force",
         action="store_true",
         help="Re-run xTB stages even if stage.done exists.",
@@ -1948,6 +2210,11 @@ def validate_args(args):
 
     if args.relax_cycles < 1:
         raise SystemExit("--relax-cycles must be >= 1.")
+
+    if args.resume_thermostat_warning and args.force:
+        raise SystemExit(
+            "--resume-thermostat-warning cannot be combined with --force."
+        )
 
 
 def main():

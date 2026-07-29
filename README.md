@@ -72,15 +72,24 @@ python3 xtb_md_pipeline.py --main --threads 8 --run
 
 Completed stages are skipped on later invocations unless `--force` is used.
 The `stage.done` marker means that a stage finished and passed all output/log
-validations. If xTB reports `thermostating problem`, the outputs are archived,
-the replica stops for inspection, and no `stage.done` is created. With
-`--force`, the old status marker and archive are explicitly invalidated before
-the new attempt begins.
+validations. The default `--thermostat-warning-policy ramp` accepts an isolated
+`thermostating problem` warning in `01_100K` and `02_200K`, after all output
+integrity checks pass, but remains strict in `03_298K_equil` and
+`04_298K_screen`. Use `strict` to reject it everywhere or `allow` to accept it
+at any stage after the same checks. Accepted warnings remain explicit in
+`stage_manifest.json`. With `--force`, the old status marker and archive are
+explicitly invalidated before the new attempt begins.
 For MD, a completed archive must contain `xtb.trj`, `mdrestart`, and `xtbmdok`.
 Restarted stages must replace the input `mdrestart` with a byte-different output.
 Each MD archive records its inputs and restart hashes in `stage_manifest.json`;
 therefore, rerunning an earlier stage can require later stages to be rerun when
 their recorded input-restart hash no longer matches.
+
+To promote an existing `stage.failed` whose sole reason is
+`thermostating problem`, without rerunning xTB, use
+`--resume-thermostat-warning`. The archive, log, required outputs, restart
+chain, and current warning policy are revalidated before `stage.done` is
+created. Other failure reasons are never promoted.
 
 The workflow is:
 
@@ -100,6 +109,16 @@ This removes artificial contacts and strain from initial packing without
 allowing a zero-temperature optimization to change the coordination state that
 the MD is intended to test. The same spherical log-Fermi wall used by MD remains
 active. Defaults are `--opt loose`, 30 cycles, and no ALPB.
+
+The native xTB optimization engine for `00_relax` can be selected with
+`--relax-engine auto|rf|lbfgs|inertial`. The default `auto` writes no `$opt`
+engine override. `inertial` selects xTB's native FIRE engine while preserving
+the fixed solute and spherical wall. Compare engines in a separate project:
+
+```bash
+python3 xtb_md_pipeline.py --system O6_I --replicas 1 \
+    --project md_fire_test --relax-engine inertial --relax-cycles 150
+```
 
 To reproduce the earlier workflow and start directly from
 `system_centered.pdb`, use:
