@@ -72,35 +72,87 @@ python3 xtb_md_pipeline.py --main --threads 8 --run
 
 Completed stages are skipped on later invocations unless `--force` is used.
 The `stage.done` marker means that a stage finished and passed all output/log
-validations. The default `--thermostat-warning-policy ramp` accepts an isolated
-`thermostating problem` warning in `01_100K` and `02_200K`, after all output
-integrity checks pass, but remains strict in `03_298K_equil` and
-`04_298K_screen`. Use `strict` to reject it everywhere or `allow` to accept it
-at any stage after the same checks. Accepted warnings remain explicit in
-`stage_manifest.json`. With `--force`, the old status marker and archive are
-explicitly invalidated before the new attempt begins.
+validations. The default `--thermostat-warning-policy allow` treats an isolated
+`thermostating problem` as a warning, at any MD stage, only after xTB returns
+zero, the log reports `normal exit of md()`, no fatal pattern is present, and
+`xtb.trj`, a new valid `mdrestart`, and `xtbmdok` all pass the integrity checks.
+The warning remains visible in the terminal and in
+`stage_manifest.json` (`thermal_result.thermostating_problem=true` and
+`warning_accepted=true`). It never bypasses output, restart, hash, or provenance
+validation. The revised protocol always canonicalizes the policy to `allow`, so
+an isolated warning cannot block 03 -> 04 after those checks pass. Legacy CLI
+values `strict` and `ramp` are accepted with a deprecation warning and mapped to
+`allow`. With `--force`, the old status marker and archive are explicitly
+invalidated before the new attempt begins.
 For MD, a completed archive must contain `xtb.trj`, `mdrestart`, and `xtbmdok`.
 Restarted stages must replace the input `mdrestart` with a byte-different output.
 Each MD archive records its inputs and restart hashes in `stage_manifest.json`;
 therefore, rerunning an earlier stage can require later stages to be rerun when
 their recorded input-restart hash no longer matches.
 
-To promote an existing `stage.failed` whose sole reason is
-`thermostating problem`, without rerunning xTB, use
-`--resume-thermostat-warning`. The archive, log, required outputs, restart
-chain, and current warning policy are revalidated before `stage.done` is
-created. Other failure reasons are never promoted.
+To resume a calculation prepared with the current protocol, without Packmol,
+recentering, input regeneration, or a repeated `00_relax`, use:
+
+```bash
+python3 xtb_md_pipeline.py --main --replicas 2 --threads 8 --run --resume
+```
+
+`--resume` validates `stage.done`/`stage.failed`, `stage_manifest.json`, the
+configuration and input hashes, the archived log, `xtb.trj`, `mdrestart`,
+`mdrestart.input`, `xtbmdok`, and restart continuity. Compatible stages print
+`REUSE`; the first absent stage prints `RUN`. A `stage.failed` whose only reason
+is `thermostating problem` is promoted without executing xTB only if all the
+new checks pass. For a legacy thermostat-only failure created before a stage
+manifest was written, configuration provenance is reconstructed from the
+untouched replica `manifest.json`, the deterministic historical stage input,
+and the archived restart/output chain; this inference is recorded explicitly
+under `recovery` in the new stage manifest. A crash, fatal log, missing
+output/restart, unchanged or malformed restart, hash inconsistency, or
+incompatible provenance is never promoted.
+
+The new stage durations are part of each stage signature, so normal `--resume`
+does not silently reuse an old 0.5/0.5/1.0 ps thermalization as the new
+1.0/2.0/3.0 ps protocol. To explicitly run only the 5 ps screening from an
+existing, valid historical `03_298K_equil` restart, use:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --main \
+    --project md_screening \
+    --replicas 2 \
+    --threads 8 \
+    --gfn 2 \
+    --charge 0 \
+    --uhf 0 \
+    --run \
+    --start-stage 04_298K_screen
+```
+
+The command above is exact for a default `md_screening` project prepared with
+the four main systems, two replicas, eight threads, GFN2, charge 0, UHF 0, and
+ALPB off. For another existing project, repeat its exact system selector,
+`--project`, replica count, thread count, GFN, charge, UHF, and ALPB setting;
+the provenance checks abort instead of guessing. This existing-only mode does
+not call Packmol, rebuild the droplet, rerun `00_relax`, or rerun 01/02/03. It
+validates the historical chain, safely promotes a thermostat-warning-only 03
+when possible, preserves its recorded historical duration, and prints an
+explicit warning that the restart came from an earlier duration configuration.
+Do not add `--force` or `--repack`.
 
 The workflow is:
 
 ```text
 Packmol spherical droplet
   -> solvent-only GFN2-xTB pre-relaxation
-  -> 100 K
-  -> 200 K
-  -> 298 K equilibration
-  -> 298 K screening
+  -> 01_100K          1 ps  initial thermal preparation (not production)
+  -> 02_200K          2 ps  intermediate heating (not production)
+  -> 03_298K_equil    3 ps  final-temperature equilibration
+  -> 04_298K_screen   5 ps  structural screening at 298.15 K
 ```
+
+`04_298K_screen` has `restart=true` and receives positions and velocities from
+the final `mdrestart` of `03_298K_equil`. It does not start from
+`system_relaxed.pdb` and does not generate new random velocities.
 
 During `00_relax`, all atoms belonging to Zn(His)2 are fixed and only the
 explicit water molecules can move. The atom range is derived from the
@@ -208,12 +260,14 @@ md_screening/
 Per replica:
 
 - solvent-only pre-relaxation, loose, at most 30 cycles
-- 100 K, 0.5 ps
-- 200 K, 0.5 ps
-- 298.15 K equilibration, 1.0 ps
-- 298.15 K screening, 5.0 ps
+- initial thermal preparation at 100 K, 1.0 ps (2000 steps; not production)
+- intermediate heating at 200 K, 2.0 ps (4000 steps; not production)
+- 298.15 K equilibration, 3.0 ps (6000 steps)
+- 298.15 K structural screening, 5.0 ps (10000 steps)
 
-GFN2-xTB by default, 0.5 fs timestep, physical H masses, SHAKE off.
+The times in ps are the source of truth; step counts above are derived from the
+0.5 fs timestep. GFN2-xTB remains the default, with physical H masses and SHAKE
+off.
 
 ## Scope boundary
 

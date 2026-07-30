@@ -1212,11 +1212,7 @@ def inspect_md_log(log_path: Path):
 
 
 def thermostat_warning_allowed(policy: str, stage_name: str) -> bool:
-    if policy == "allow":
-        return True
-    if policy == "ramp":
-        return stage_name in {"01_100K", "02_200K"}
-    return False
+    return policy == "allow"
 
 
 def md_thermal_result(
@@ -1358,35 +1354,49 @@ def historical_md_stage_configuration(
             f"{STAGES[stage_index]['name']} from {manifest_path}."
         ) from exc
 
-    geometry_name = (
-        "system_relaxed.pdb"
-        if stage_index == 0 and relaxation_enabled
-        else "system_centered.pdb"
-    )
-    input_name = f"{stage['name']}.inp"
-    configuration = {
-        "stage": stage["name"],
-        "gfn": xtb["gfn"],
-        "charge": xtb["charge"],
-        "uhf": xtb["uhf"],
-        "alpb": xtb["alpb"],
-        "threads": xtb["threads"],
-        "temp_K": stage["temp"],
-        "time_ps": stage["time"],
-        "step_fs": md["step_fs"],
-        "dump_fs": md["dump_fs"],
-        "hmass": md["hmass"],
-        "shake": md["shake"],
-        "sccacc": md["sccacc"],
-        "restart": stage["restart"],
-        "wall_radius_bohr": wall_radius_bohr,
-        "input_geometry": geometry_name,
-        "input_geometry_sha256": file_sha256(
-            replica_dir / geometry_name
-        ),
-        "xtb_input_sha256": file_sha256(replica_dir / input_name),
-        "input_restart_sha256": input_restart_sha256,
-    }
+    try:
+        geometry_name = (
+            "system_relaxed.pdb"
+            if stage_index == 0 and relaxation_enabled
+            else "system_centered.pdb"
+        )
+        input_name = f"{stage['name']}.inp"
+        input_path = replica_dir / input_name
+        input_text = input_path.read_text()
+        expected_input_text = md_input(stage, wall_radius_bohr)
+        if input_text != expected_input_text:
+            raise RuntimeError(
+                f"Historical input {input_path} does not match the stage "
+                "configuration recorded in manifest.json."
+            )
+        configuration = {
+            "stage": stage["name"],
+            "gfn": xtb["gfn"],
+            "charge": xtb["charge"],
+            "uhf": xtb["uhf"],
+            "alpb": xtb["alpb"],
+            "threads": xtb["threads"],
+            "temp_K": stage["temp"],
+            "time_ps": stage["time"],
+            "step_fs": md["step_fs"],
+            "dump_fs": md["dump_fs"],
+            "hmass": md["hmass"],
+            "shake": md["shake"],
+            "sccacc": md["sccacc"],
+            "restart": stage["restart"],
+            "wall_radius_bohr": wall_radius_bohr,
+            "input_geometry": geometry_name,
+            "input_geometry_sha256": file_sha256(
+                replica_dir / geometry_name
+            ),
+            "xtb_input_sha256": file_sha256(input_path),
+            "input_restart_sha256": input_restart_sha256,
+        }
+    except (KeyError, OSError) as exc:
+        raise RuntimeError(
+            f"Historical provenance inputs for {stage['name']} are "
+            f"incomplete or unreadable in {replica_dir}."
+        ) from exc
     return stage, configuration
 
 
@@ -1429,12 +1439,15 @@ def write_md_stage_manifest(
     output_restart_sha256: str,
     thermal_result: dict,
     returncode: int = 0,
+    recovery: dict | None = None,
 ):
     archive.mkdir(parents=True, exist_ok=True)
     data = dict(configuration)
     data["returncode"] = returncode
     data["output_restart_sha256"] = output_restart_sha256
     data["thermal_result"] = thermal_result
+    if recovery is not None:
+        data["recovery"] = recovery
     (archive / "stage_manifest.json").write_text(
         json.dumps(data, indent=2)
     )
@@ -1489,27 +1502,26 @@ def validate_completed_md_stage(
             "Use --force to rerun it."
         )
 
+    # Legacy successful manifests predate the returncode field. Their
+    # stage.done marker was written only after the xTB return-code check;
+    # retain that control-flow evidence so existing 01--03 archives remain
+    # resumable. Failed-stage promotion is stricter and requires an explicit
+    # recorded zero whenever a stage manifest already exists.
     if recorded.get("returncode", 0) != 0:
         raise RuntimeError(
             f"Stage {stage_name} records a nonzero xTB return code."
         )
 
-    archived_restart_hash = file_sha256(archive / "mdrestart")
+    archived_restart_hash = validate_output_restart(
+        archive / "mdrestart",
+        expected_configuration["input_restart_sha256"],
+        expected_atoms=restart_atom_count(archive.parent.parent),
+    )
     if recorded.get("output_restart_sha256") != archived_restart_hash:
         raise RuntimeError(
             f"Stage {stage_name} has an archived mdrestart inconsistent with "
             "stage_manifest.json. Inspect the archive and rerun with --force."
         )
-    if (
-        expected_configuration["input_restart_sha256"] is not None
-        and archived_restart_hash
-        == expected_configuration["input_restart_sha256"]
-    ):
-        raise RuntimeError(
-            f"Stage {stage_name} output restart is byte-identical to its "
-            "input restart."
-        )
-
     if expected_configuration["restart"]:
         archived_input_hash = file_sha256(archive / "mdrestart.input")
         if (
@@ -1551,6 +1563,13 @@ def validate_completed_md_stage(
                 f"Stage {stage_name} thermal_result field '{key}' is "
                 "inconsistent with the archived log."
             )
+    if bool(thermal_result.get("warning_accepted")) != bool(
+        validation["thermostating_problem"]
+    ):
+        raise RuntimeError(
+            f"Stage {stage_name} thermal_result has an inconsistent "
+            "warning_accepted value."
+        )
 
     if validation["thermostating_problem"]:
         if not validation["normal_exit_of_md"]:
@@ -1572,12 +1591,61 @@ def validate_completed_md_stage(
     return recorded
 
 
+def restart_atom_count(replica_dir: Path) -> int:
+    try:
+        manifest = json.loads((replica_dir / "manifest.json").read_text())
+        count = manifest["geometry_after_centering"]["n_atoms"]
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        raise RuntimeError(
+            f"Cannot determine restart atom count from "
+            f"{replica_dir}/manifest.json."
+        ) from exc
+    if not isinstance(count, int) or count < 1:
+        raise RuntimeError(
+            f"Invalid restart atom count in {replica_dir}/manifest.json."
+        )
+    return count
+
+
 def validate_output_restart(
     output_restart: Path,
     input_restart_sha256: str | None,
+    *,
+    expected_atoms: int,
 ) -> str:
-    if not output_restart.exists():
+    if not output_restart.is_file():
         raise RuntimeError("missing mdrestart")
+    if output_restart.stat().st_size == 0:
+        raise RuntimeError("empty mdrestart")
+    rows = [
+        line.split()
+        for line in output_restart.read_text(errors="replace").splitlines()
+        if line.strip()
+    ]
+    if len(rows) != expected_atoms:
+        raise RuntimeError(
+            f"invalid mdrestart atom count: found {len(rows)}, "
+            f"expected {expected_atoms}"
+        )
+    for row_index, fields in enumerate(rows, start=1):
+        if len(fields) != 6:
+            raise RuntimeError(
+                f"invalid mdrestart row {row_index}: expected 6 numeric "
+                f"columns, found {len(fields)}"
+            )
+        try:
+            values = [
+                float(value.replace("D", "E").replace("d", "e"))
+                for value in fields
+            ]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid mdrestart row {row_index}: non-numeric value"
+            ) from exc
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError(
+                f"invalid mdrestart row {row_index}: non-finite value"
+            )
     output_sha256 = file_sha256(output_restart)
     if (
         input_restart_sha256 is not None
@@ -1650,7 +1718,8 @@ def recover_thermostat_warning_stage(
         )
 
     manifest_path = archive / "stage_manifest.json"
-    if manifest_path.exists():
+    had_stage_manifest = manifest_path.exists()
+    if had_stage_manifest:
         try:
             recorded = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -1664,7 +1733,7 @@ def recover_thermostat_warning_stage(
                 f"Cannot recover {stage_name}: archived configuration is "
                 f"incompatible (fields: {', '.join(mismatched)})."
             )
-        if recorded.get("returncode", 0) != 0:
+        if recorded.get("returncode") != 0:
             raise RuntimeError(
                 f"Cannot recover {stage_name}: archived return code is "
                 f"{recorded.get('returncode')}."
@@ -1682,6 +1751,7 @@ def recover_thermostat_warning_stage(
     output_restart_sha256 = validate_output_restart(
         archive / "mdrestart",
         input_restart_sha256,
+        expected_atoms=restart_atom_count(archive.parent.parent),
     )
     if (
         manifest_path.exists()
@@ -1713,6 +1783,26 @@ def recover_thermostat_warning_stage(
         configuration,
         output_restart_sha256,
         thermal_result,
+        recovery={
+            "promoted_from_stage_failed": True,
+            "original_failure_reason": reason,
+            "configuration_source": (
+                "existing stage_manifest.json"
+                if had_stage_manifest
+                else (
+                    "legacy manifest.json plus deterministic stage input "
+                    "and archived restart/output chain"
+                )
+            ),
+            "returncode_evidence": (
+                "recorded returncode == 0"
+                if had_stage_manifest
+                else (
+                    "legacy pipeline created a thermostat-only stage.failed "
+                    "marker only after returncode == 0"
+                )
+            ),
+        },
     )
     mark_stage_done(archive)
     print(
@@ -1811,10 +1901,13 @@ def run_relaxation(replica_dir: Path, args, env):
                 "Completed relaxation has moved fixed solute atoms by "
                 f"{displacement['solute_max_displacement_A']:.6f} A."
             )
-        print(
-            f"  SKIP {replica_dir.parent.name}/{replica_dir.name} "
-            "00_relax: already completed"
-        )
+        if args.resume or args.start_stage is not None:
+            print("  REUSE 00_relax")
+        else:
+            print(
+                f"  SKIP {replica_dir.parent.name}/{replica_dir.name} "
+                "00_relax: already completed"
+            )
         return
 
     if relaxed_pdb.exists() and not args.force:
@@ -1924,6 +2017,11 @@ def validate_historical_md_prefix(
             stage_index,
             previous_output_sha256,
         )
+        validate_historical_stage_compatibility(
+            configuration,
+            STAGES[stage_index],
+            args,
+        )
         archive = stage_archive_dir(replica_dir, stage["name"])
         recover_thermostat_warning_stage(
             stage,
@@ -1944,45 +2042,65 @@ def validate_historical_md_prefix(
     return previous_configuration
 
 
-def validate_start_predecessor_compatibility(
-    previous_configuration: dict,
-    previous_stage: dict,
-    start_stage_name: str,
+def validate_historical_stage_compatibility(
+    historical_configuration: dict,
+    current_stage: dict,
     args,
 ) -> dict | None:
-    """Permit only an explicit historical duration mismatch for a restart."""
+    """Require current E2 settings except for an explicit old duration."""
     expected = {
         "gfn": args.gfn,
         "charge": args.charge,
         "uhf": args.uhf,
         "alpb": args.alpb,
         "threads": args.threads,
-        "temp_K": previous_stage["temp"],
+        "temp_K": current_stage["temp"],
         "step_fs": MD_STEP_FS,
         "dump_fs": MD_DUMP_FS,
         "hmass": 1,
         "shake": 0,
         "sccacc": 1.0,
-        "restart": previous_stage["restart"],
+        "restart": current_stage["restart"],
     }
-    mismatched = configuration_mismatches(expected, previous_configuration)
+    mismatched = configuration_mismatches(
+        expected,
+        historical_configuration,
+    )
     if mismatched:
         raise RuntimeError(
-            f"Cannot start from {previous_stage['name']}: historical "
+            f"Cannot reuse historical {current_stage['name']}: "
             "provenance is incompatible with the requested E2 settings "
             f"(fields: {', '.join(mismatched)})."
         )
 
-    previous_time = previous_configuration["time_ps"]
-    if previous_time == previous_stage["time"]:
+    historical_time = historical_configuration["time_ps"]
+    if historical_time == current_stage["time"]:
         return None
 
-    override = {
-        "previous_stage": previous_stage["name"],
-        "historical_time_ps": previous_time,
-        "current_default_time_ps": previous_stage["time"],
+    return {
+        "previous_stage": current_stage["name"],
+        "historical_time_ps": historical_time,
+        "current_default_time_ps": current_stage["time"],
         "explicit_start_stage_override": True,
     }
+
+
+def validate_start_predecessor_compatibility(
+    previous_configuration: dict,
+    previous_stage: dict,
+    start_stage_name: str,
+    args,
+) -> dict | None:
+    """Report an explicit historical-duration exception for the predecessor."""
+    override = validate_historical_stage_compatibility(
+        previous_configuration,
+        previous_stage,
+        args,
+    )
+    if override is None:
+        return None
+
+    previous_time = override["historical_time_ps"]
     print(
         f"  WARNING: starting {start_stage_name} from an existing "
         f"{previous_stage['name']} generated with a previous stage-duration "
@@ -2026,7 +2144,6 @@ def run_replica(replica_dir: Path, args):
                     "00_relax stage is required."
                 )
             run_relaxation(replica_dir, args, env)
-            print("  REUSE 00_relax")
     elif args.start_stage is not None:
         if args.start_stage == "00_relax":
             if not relaxation_enabled:
@@ -2050,7 +2167,6 @@ def run_replica(replica_dir: Path, args):
                         "00_relax stage is required."
                     )
                 run_relaxation(replica_dir, args, env)
-                print("  REUSE 00_relax")
 
             previous_configuration = validate_historical_md_prefix(
                 replica_dir,
@@ -2256,6 +2372,7 @@ def run_replica(replica_dir: Path, args):
             output_restart_sha256 = validate_output_restart(
                 restart_path,
                 input_restart_sha256,
+                expected_atoms=restart_atom_count(replica_dir),
             )
         except RuntimeError as exc:
             archive_failed_md_stage(
@@ -2268,7 +2385,7 @@ def run_replica(replica_dir: Path, args):
                     "restart. Outputs were archived for inspection."
                 ) from exc
             raise RuntimeError(
-                f"{name} ended without mdrestart for "
+                f"{name} ended with invalid mdrestart ({exc}) for "
                 f"{replica_dir.parent.name}/{replica_dir.name}. "
                 f"Outputs were archived for inspection. See {log_path}"
             ) from exc
@@ -2593,8 +2710,9 @@ def parse_args():
         default="allow",
         choices=["strict", "ramp", "allow"],
         help=(
-            "Policy for xTB 'thermostating problem' warnings "
-            "(default: allow after all integrity checks pass)."
+            "Record an isolated xTB 'thermostating problem' as a warning "
+            "after all integrity checks pass. Legacy strict/ramp values are "
+            "accepted but mapped to allow (default: allow)."
         ),
     )
 
@@ -2651,6 +2769,14 @@ def select_systems(args):
 
 
 def validate_args(args):
+    if args.thermostat_warning_policy != "allow":
+        print(
+            "WARNING: --thermostat-warning-policy "
+            f"{args.thermostat_warning_policy} is deprecated by the revised "
+            "E2 protocol and will be treated as 'allow'."
+        )
+        args.thermostat_warning_policy = "allow"
+
     if args.replicas < 1:
         raise SystemExit("--replicas must be >= 1.")
 
