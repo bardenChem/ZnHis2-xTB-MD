@@ -1142,6 +1142,210 @@ def stage_archive_dir(replica_dir: Path, stage_name: str) -> Path:
     return replica_dir / "stages" / stage_name
 
 
+def validate_historical_relaxation(replica_dir: Path):
+    """Validate a completed relaxation against its own historical records."""
+    archive = stage_archive_dir(replica_dir, "00_relax")
+    done = archive / "stage.done"
+    if not done.is_file():
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: missing {done}."
+        )
+    failed = archive / "stage.failed"
+    if failed.exists():
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: conflicting stage.done and "
+            f"stage.failed markers exist in {archive}."
+        )
+
+    manifest_path = replica_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: missing or invalid "
+            f"{manifest_path}."
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: invalid {manifest_path}."
+        )
+
+    relaxation = manifest.get("relaxation")
+    if not isinstance(relaxation, dict):
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: manifest relaxation record "
+            "is missing or invalid."
+        )
+    if relaxation.get("enabled") is not True:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: manifest records "
+            "relaxation.enabled != true."
+        )
+
+    relaxation_result = manifest.get("relaxation_result")
+    configuration = (
+        relaxation_result.get("configuration")
+        if isinstance(relaxation_result, dict)
+        else None
+    )
+    if not isinstance(configuration, dict) or not configuration:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: "
+            "relaxation_result.configuration is missing or invalid."
+        )
+
+    centered_pdb = replica_dir / "system_centered.pdb"
+    relaxed_pdb = replica_dir / "system_relaxed.pdb"
+    for geometry in (centered_pdb, relaxed_pdb):
+        if not geometry.is_file():
+            raise RuntimeError(
+                f"Cannot reuse historical 00_relax: missing {geometry}."
+            )
+
+    try:
+        geometry_record = manifest["geometry_after_centering"]
+        wall_record = manifest["wall"]
+        xtb_record = manifest["xtb"]
+        n_total = geometry_record["n_atoms"]
+        n_solute = relaxation["n_solute_atoms"]
+        fixed_atoms = relaxation["fixed_atoms"]
+        relaxation_gfn = relaxation["gfn"]
+        optimization_level = relaxation["optimization_level"]
+        optimization_engine = relaxation.get(
+            "optimization_engine", "auto"
+        )
+        max_cycles = relaxation["max_cycles"]
+        wall_radius_bohr = wall_record["radius_bohr"]
+        xtb_gfn = xtb_record["gfn"]
+        charge = xtb_record["charge"]
+        uhf = xtb_record["uhf"]
+        alpb = xtb_record["alpb"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: required historical manifest "
+            f"field is missing or invalid ({exc})."
+        ) from exc
+
+    if (
+        not isinstance(n_total, int)
+        or isinstance(n_total, bool)
+        or n_total < 1
+        or not isinstance(n_solute, int)
+        or isinstance(n_solute, bool)
+        or not 1 <= n_solute <= n_total
+    ):
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: invalid historical atom "
+            f"counts (n_atoms={n_total!r}, n_solute_atoms={n_solute!r})."
+        )
+
+    expected_fixed_atoms = f"1-{n_solute}"
+    if fixed_atoms != expected_fixed_atoms:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: relaxation.fixed_atoms "
+            f"is {fixed_atoms!r}, expected {expected_fixed_atoms!r} from "
+            "relaxation.n_solute_atoms."
+        )
+    if configuration.get("fixed_atoms") != fixed_atoms:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: configuration.fixed_atoms "
+            "does not match relaxation.fixed_atoms."
+        )
+
+    try:
+        centered_atoms = pdb_atoms(centered_pdb)
+        relaxed_atoms = pdb_atoms(relaxed_pdb)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: invalid historical geometry "
+            f"({exc})."
+        ) from exc
+    if len(centered_atoms) != n_total:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_centered.pdb has "
+            f"{len(centered_atoms)} atoms, expected {n_total}."
+        )
+    if len(relaxed_atoms) != n_total:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_relaxed.pdb has "
+            f"{len(relaxed_atoms)} atoms, expected {n_total}."
+        )
+    for geometry_name, atoms in (
+        ("system_centered.pdb", centered_atoms),
+        ("system_relaxed.pdb", relaxed_atoms),
+    ):
+        if any(
+            not all(math.isfinite(value) for value in atom["xyz"])
+            for atom in atoms
+        ):
+            raise RuntimeError(
+                "Cannot reuse historical 00_relax: "
+                f"{geometry_name} contains non-finite coordinates."
+            )
+    if [
+        atom["element"] for atom in centered_atoms
+    ] != [
+        atom["element"] for atom in relaxed_atoms
+    ]:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: element sequence differs "
+            "between system_centered.pdb and system_relaxed.pdb."
+        )
+
+    centered_sha256 = file_sha256(centered_pdb)
+    if configuration.get("input_sha256") != centered_sha256:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_centered.pdb SHA-256 "
+            "does not match configuration.input_sha256."
+        )
+
+    if relaxation_gfn != xtb_gfn:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: relaxation.gfn does not "
+            "match xtb.gfn."
+        )
+
+    expected_configuration = {
+        "gfn": xtb_gfn,
+        "charge": charge,
+        "uhf": uhf,
+        "alpb": alpb,
+        "optimization_level": optimization_level,
+        "optimization_engine": optimization_engine,
+        "max_cycles": max_cycles,
+        "wall_radius_bohr": wall_radius_bohr,
+    }
+    historical_configuration = dict(configuration)
+    # Results predating --relax-engine used xTB's default engine selection.
+    historical_configuration.setdefault("optimization_engine", "auto")
+    mismatches = [
+        field
+        for field, expected in expected_configuration.items()
+        if historical_configuration.get(field) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: historical configuration "
+            "does not match the manifest (fields: "
+            + ", ".join(mismatches)
+            + ")."
+        )
+
+    displacement = solute_displacement(
+        centered_pdb,
+        relaxed_pdb,
+        n_solute,
+    )
+    if displacement["solute_max_displacement_A"] > 1.0e-3:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: fixed solute atoms moved by "
+            f"{displacement['solute_max_displacement_A']:.6f} A, exceeding "
+            "the 0.001 A tolerance."
+        )
+
+    print("  REUSE 00_relax")
+
+
 def restore_restart_from_previous(
     replica_dir: Path,
     stage_index: int,
@@ -2400,15 +2604,7 @@ def run_replica(replica_dir: Path, args):
 
     if args.resume:
         if relaxation_enabled:
-            relax_done = (
-                stage_archive_dir(replica_dir, "00_relax") / "stage.done"
-            )
-            if not relax_done.exists():
-                raise RuntimeError(
-                    "--resume will not execute 00_relax. A completed reusable "
-                    "00_relax stage is required."
-                )
-            run_relaxation(replica_dir, args, env)
+            validate_historical_relaxation(replica_dir)
     elif args.start_stage is not None:
         if args.start_stage == "00_relax":
             if not relaxation_enabled:
@@ -2423,15 +2619,7 @@ def run_replica(replica_dir: Path, args):
                 if item["name"] == args.start_stage
             )
             if relaxation_enabled:
-                relax_done = (
-                    stage_archive_dir(replica_dir, "00_relax") / "stage.done"
-                )
-                if not relax_done.exists():
-                    raise RuntimeError(
-                        f"Cannot start at {args.start_stage}: a completed "
-                        "00_relax stage is required."
-                    )
-                run_relaxation(replica_dir, args, env)
+                validate_historical_relaxation(replica_dir)
 
             previous_configuration = validate_historical_md_prefix(
                 replica_dir,
