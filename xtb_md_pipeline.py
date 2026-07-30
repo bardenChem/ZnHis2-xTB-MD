@@ -12,9 +12,9 @@ Current scope
 4. Centers the packed droplet at its total center of mass.
 5. Creates a solvent-only xTB pre-relaxation input and xTB MD inputs for:
       00_relax       short optimization with Zn(His)2 fixed
-      01_100K        0.5 ps
-      02_200K        0.5 ps
-      03_298K_equil  1.0 ps
+      01_100K        1.0 ps initial thermal preparation (not production)
+      02_200K        2.0 ps intermediate heating (not production)
+      03_298K_equil  3.0 ps final-temperature equilibration
       04_298K_screen 5.0 ps
 6. Optionally runs xTB sequentially, chaining stages through mdrrestart.
 7. Archives trajectories, logs, restart files and snapshots per stage.
@@ -49,6 +49,8 @@ from typing import Iterable
 BOHR_PER_ANGSTROM = 1.8897261254578281
 AVOGADRO = 6.02214076e23
 WATER_MOLAR_MASS = 18.01528  # g/mol
+MD_STEP_FS = 0.5
+MD_DUMP_FS = 10.0
 
 ROOT = Path(__file__).resolve().parent
 
@@ -108,28 +110,36 @@ STAGES = [
     {
         "name": "01_100K",
         "temp": 100.0,
-        "time": 0.5,
+        "time": 1.0,
         "restart": False,
+        "purpose": (
+            "Initial thermal preparation of the droplet; not 100 K production."
+        ),
     },
     {
         "name": "02_200K",
         "temp": 200.0,
-        "time": 0.5,
+        "time": 2.0,
         "restart": True,
+        "purpose": "Intermediate heating; not 200 K production.",
     },
     {
         "name": "03_298K_equil",
         "temp": 298.15,
-        "time": 1.0,
+        "time": 3.0,
         "restart": True,
+        "purpose": "Equilibration at the final temperature.",
     },
     {
         "name": "04_298K_screen",
         "temp": 298.15,
         "time": 5.0,
         "restart": True,
+        "purpose": "Structural screening at 298.15 K.",
     },
 ]
+
+EXECUTION_STAGES = ["00_relax", *(stage["name"] for stage in STAGES)]
 
 FATAL_MD_PATTERNS = [
     "MD is unstable",
@@ -646,14 +656,26 @@ def run_packmol(
 # xTB input and run
 # ---------------------------------------------------------------------------
 
+def md_step_count(stage: dict) -> int:
+    """Derive the integral MD step count from the time in ps."""
+    exact_steps = stage["time"] * 1000.0 / MD_STEP_FS
+    steps = round(exact_steps)
+    if not math.isclose(exact_steps, steps, abs_tol=1.0e-9):
+        raise ValueError(
+            f"Stage {stage['name']} time ({stage['time']} ps) is not an "
+            f"integral number of {MD_STEP_FS} fs steps."
+        )
+    return steps
+
+
 def md_input(stage, wall_radius_bohr: float) -> str:
     restart = "true" if stage["restart"] else "false"
 
     return f"""$md
    temp={stage['temp']:.2f}
    time={stage['time']:.3f}
-   dump=10.0
-   step=0.5
+   dump={MD_DUMP_FS:.1f}
+   step={MD_STEP_FS:.1f}
    velo=true
    nvt=true
    hmass=1
@@ -775,8 +797,8 @@ def write_manifest(
             "threads": args.threads,
         },
         "md": {
-            "step_fs": 0.5,
-            "dump_fs": 10.0,
+            "step_fs": MD_STEP_FS,
+            "dump_fs": MD_DUMP_FS,
             "hmass": 1,
             "shake": 0,
             "sccacc": 1.0,
@@ -1227,6 +1249,7 @@ def archive_stage_outputs(
         "mdrestart",
         "mdrestart.input",
         "xtbmdok",
+        f"{stage_name}.inp",
     ]
 
     for filename in core_outputs:
@@ -1286,8 +1309,8 @@ def md_stage_configuration(
         "threads": args.threads,
         "temp_K": stage["temp"],
         "time_ps": stage["time"],
-        "step_fs": 0.5,
-        "dump_fs": 10.0,
+        "step_fs": MD_STEP_FS,
+        "dump_fs": MD_DUMP_FS,
         "hmass": 1,
         "shake": 0,
         "sccacc": 1.0,
@@ -1299,8 +1322,105 @@ def md_stage_configuration(
         ),
         "xtb_input_sha256": file_sha256(replica_dir / input_name),
         "input_restart_sha256": input_restart_sha256,
-        "thermostat_warning_policy": args.thermostat_warning_policy,
     }
+
+
+def configuration_mismatches(expected: dict, recorded: dict) -> list[str]:
+    """Return physical/provenance fields that differ from the expectation."""
+    return [
+        key for key, expected_value in expected.items()
+        if recorded.get(key) != expected_value
+    ]
+
+
+def historical_md_stage_configuration(
+    replica_dir: Path,
+    stage_index: int,
+    input_restart_sha256: str | None,
+) -> tuple[dict, dict]:
+    """Reconstruct a stage signature from the untouched historical manifest."""
+    manifest_path = replica_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        recorded_stages = manifest["md"]["stages"]
+        stage_name = STAGES[stage_index]["name"]
+        stage = next(
+            item for item in recorded_stages
+            if item.get("name") == stage_name
+        )
+        xtb = manifest["xtb"]
+        md = manifest["md"]
+        wall_radius_bohr = manifest["wall"]["radius_bohr"]
+        relaxation_enabled = manifest["relaxation"]["enabled"]
+    except (OSError, json.JSONDecodeError, KeyError, StopIteration) as exc:
+        raise RuntimeError(
+            f"Cannot reconstruct historical provenance for "
+            f"{STAGES[stage_index]['name']} from {manifest_path}."
+        ) from exc
+
+    geometry_name = (
+        "system_relaxed.pdb"
+        if stage_index == 0 and relaxation_enabled
+        else "system_centered.pdb"
+    )
+    input_name = f"{stage['name']}.inp"
+    configuration = {
+        "stage": stage["name"],
+        "gfn": xtb["gfn"],
+        "charge": xtb["charge"],
+        "uhf": xtb["uhf"],
+        "alpb": xtb["alpb"],
+        "threads": xtb["threads"],
+        "temp_K": stage["temp"],
+        "time_ps": stage["time"],
+        "step_fs": md["step_fs"],
+        "dump_fs": md["dump_fs"],
+        "hmass": md["hmass"],
+        "shake": md["shake"],
+        "sccacc": md["sccacc"],
+        "restart": stage["restart"],
+        "wall_radius_bohr": wall_radius_bohr,
+        "input_geometry": geometry_name,
+        "input_geometry_sha256": file_sha256(
+            replica_dir / geometry_name
+        ),
+        "xtb_input_sha256": file_sha256(replica_dir / input_name),
+        "input_restart_sha256": input_restart_sha256,
+    }
+    return stage, configuration
+
+
+def validate_current_md_input(
+    replica_dir: Path,
+    stage: dict,
+    *,
+    create_missing: bool = False,
+):
+    """Ensure an existing input is exactly the requested current protocol."""
+    manifest_path = replica_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        wall_radius_bohr = manifest["wall"]["radius_bohr"]
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        raise RuntimeError(
+            f"Cannot validate MD input from {manifest_path}."
+        ) from exc
+
+    input_path = replica_dir / f"{stage['name']}.inp"
+    expected = md_input(stage, wall_radius_bohr)
+    if create_missing and not input_path.exists():
+        input_path.write_text(expected)
+        print(f"  PREPARE {stage['name']} input")
+    try:
+        actual = input_path.read_text()
+    except OSError as exc:
+        raise RuntimeError(f"Missing MD input: {input_path}.") from exc
+    if actual != expected:
+        raise RuntimeError(
+            f"{input_path} is incompatible with the current "
+            f"{stage['name']} protocol. Resume/start-stage will not overwrite "
+            "an existing input."
+        )
 
 
 def write_md_stage_manifest(
@@ -1308,9 +1428,11 @@ def write_md_stage_manifest(
     configuration: dict,
     output_restart_sha256: str,
     thermal_result: dict,
+    returncode: int = 0,
 ):
     archive.mkdir(parents=True, exist_ok=True)
     data = dict(configuration)
+    data["returncode"] = returncode
     data["output_restart_sha256"] = output_restart_sha256
     data["thermal_result"] = thermal_result
     (archive / "stage_manifest.json").write_text(
@@ -1321,15 +1443,19 @@ def write_md_stage_manifest(
 def validate_completed_md_stage(
     archive: Path,
     expected_configuration: dict,
-):
+    warning_policy: str,
+) -> dict:
     stage_name = expected_configuration["stage"]
     required = [
         "stage.done",
         "mdrestart",
         "xtb.trj",
         "xtbmdok",
+        f"{stage_name}.out",
         "stage_manifest.json",
     ]
+    if expected_configuration["restart"]:
+        required.append("mdrestart.input")
     if (archive / "stage.failed").exists():
         raise RuntimeError(
             f"Stage {stage_name} has both success and failure markers. "
@@ -1352,15 +1478,20 @@ def validate_completed_md_stage(
             "Inspect the archive and rerun with --force."
         ) from exc
 
-    mismatched = [
-        key for key, expected in expected_configuration.items()
-        if recorded.get(key) != expected
-    ]
+    mismatched = configuration_mismatches(
+        expected_configuration,
+        recorded,
+    )
     if mismatched:
         raise RuntimeError(
             f"Completed stage {stage_name} is incompatible with the current "
             f"MD settings (fields: {', '.join(mismatched)}). "
             "Use --force to rerun it."
+        )
+
+    if recorded.get("returncode", 0) != 0:
+        raise RuntimeError(
+            f"Stage {stage_name} records a nonzero xTB return code."
         )
 
     archived_restart_hash = file_sha256(archive / "mdrestart")
@@ -1369,11 +1500,76 @@ def validate_completed_md_stage(
             f"Stage {stage_name} has an archived mdrestart inconsistent with "
             "stage_manifest.json. Inspect the archive and rerun with --force."
         )
-    if not isinstance(recorded.get("thermal_result"), dict):
+    if (
+        expected_configuration["input_restart_sha256"] is not None
+        and archived_restart_hash
+        == expected_configuration["input_restart_sha256"]
+    ):
+        raise RuntimeError(
+            f"Stage {stage_name} output restart is byte-identical to its "
+            "input restart."
+        )
+
+    if expected_configuration["restart"]:
+        archived_input_hash = file_sha256(archive / "mdrestart.input")
+        if (
+            archived_input_hash
+            != expected_configuration["input_restart_sha256"]
+        ):
+            raise RuntimeError(
+                f"Stage {stage_name} archived input restart does not match "
+                "the validated output restart of the previous stage."
+            )
+
+    archived_input = archive / f"{stage_name}.inp"
+    if (
+        archived_input.exists()
+        and file_sha256(archived_input)
+        != expected_configuration["xtb_input_sha256"]
+    ):
+        raise RuntimeError(
+            f"Stage {stage_name} archived xTB input is inconsistent with "
+            "stage_manifest.json."
+        )
+
+    thermal_result = recorded.get("thermal_result")
+    if not isinstance(thermal_result, dict):
         raise RuntimeError(
             f"Stage {stage_name} has no valid thermal_result in "
             "stage_manifest.json. Inspect the archive and rerun with --force."
         )
+
+    validation = inspect_md_log(archive / f"{stage_name}.out")
+    if validation["fatal_patterns"]:
+        raise RuntimeError(
+            f"Stage {stage_name} archived log contains fatal pattern(s): "
+            f"{', '.join(validation['fatal_patterns'])}."
+        )
+    for key in ["thermostating_problem", "normal_exit_of_md"]:
+        if thermal_result.get(key) != validation[key]:
+            raise RuntimeError(
+                f"Stage {stage_name} thermal_result field '{key}' is "
+                "inconsistent with the archived log."
+            )
+
+    if validation["thermostating_problem"]:
+        if not validation["normal_exit_of_md"]:
+            raise RuntimeError(
+                f"Stage {stage_name} has 'thermostating problem' without "
+                "'normal exit of md()'."
+            )
+        if not thermal_result.get("warning_accepted"):
+            raise RuntimeError(
+                f"Stage {stage_name} is marked done but its thermostat "
+                "warning was not recorded as accepted."
+            )
+        if not thermostat_warning_allowed(warning_policy, stage_name):
+            raise RuntimeError(
+                f"Stage {stage_name} thermostat warning is not accepted by "
+                f"policy '{warning_policy}'."
+            )
+
+    return recorded
 
 
 def validate_output_restart(
@@ -1394,14 +1590,14 @@ def validate_output_restart(
 
 
 def recover_thermostat_warning_stage(
-    replica_dir: Path,
     stage: dict,
     archive: Path,
     configuration: dict,
     args,
+    recovery_requested: bool,
 ) -> bool:
     failed = archive / "stage.failed"
-    if not args.resume_thermostat_warning or not failed.exists():
+    if not recovery_requested or not failed.exists():
         return False
 
     stage_name = stage["name"]
@@ -1447,6 +1643,32 @@ def recover_thermostat_warning_stage(
             f"Cannot recover {stage_name}: archived log does not contain "
             "'thermostating problem'."
         )
+    if not validation["normal_exit_of_md"]:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived warning is not followed "
+            "by 'normal exit of md()'."
+        )
+
+    manifest_path = archive / "stage_manifest.json"
+    if manifest_path.exists():
+        try:
+            recorded = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: unreadable "
+                "stage_manifest.json."
+            ) from exc
+        mismatched = configuration_mismatches(configuration, recorded)
+        if mismatched:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived configuration is "
+                f"incompatible (fields: {', '.join(mismatched)})."
+            )
+        if recorded.get("returncode", 0) != 0:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived return code is "
+                f"{recorded.get('returncode')}."
+            )
 
     input_restart_sha256 = configuration["input_restart_sha256"]
     if stage["restart"]:
@@ -1461,6 +1683,25 @@ def recover_thermostat_warning_stage(
         archive / "mdrestart",
         input_restart_sha256,
     )
+    if (
+        manifest_path.exists()
+        and recorded.get("output_restart_sha256")
+        != output_restart_sha256
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: output restart hash is "
+            "inconsistent with stage_manifest.json."
+        )
+    archived_input = archive / f"{stage_name}.inp"
+    if (
+        archived_input.exists()
+        and file_sha256(archived_input)
+        != configuration["xtb_input_sha256"]
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived xTB input hash is "
+            "inconsistent with historical provenance."
+        )
     thermal_result = md_thermal_result(
         stage,
         validation,
@@ -1486,6 +1727,7 @@ def prepare_md_stage_attempt(
     stage_name: str,
     force: bool,
     expected_configuration: dict,
+    warning_policy: str,
 ):
     archive = stage_archive_dir(replica_dir, stage_name)
     done = archive / "stage.done"
@@ -1500,7 +1742,11 @@ def prepare_md_stage_attempt(
         return archive, False
 
     if done.exists():
-        validate_completed_md_stage(archive, expected_configuration)
+        validate_completed_md_stage(
+            archive,
+            expected_configuration,
+            warning_policy,
+        )
         return archive, True
     if failed.exists():
         raise RuntimeError(
@@ -1663,34 +1909,182 @@ def run_relaxation(replica_dir: Path, args, env):
         print("  OK   00_relax")
 
 
+def validate_historical_md_prefix(
+    replica_dir: Path,
+    stop_index: int,
+    args,
+) -> dict | None:
+    """Validate/reuse historical MD stages preceding an explicit start."""
+    previous_output_sha256 = None
+    previous_configuration = None
+
+    for stage_index in range(stop_index):
+        stage, configuration = historical_md_stage_configuration(
+            replica_dir,
+            stage_index,
+            previous_output_sha256,
+        )
+        archive = stage_archive_dir(replica_dir, stage["name"])
+        recover_thermostat_warning_stage(
+            stage,
+            archive,
+            configuration,
+            args,
+            recovery_requested=True,
+        )
+        recorded = validate_completed_md_stage(
+            archive,
+            configuration,
+            args.thermostat_warning_policy,
+        )
+        previous_output_sha256 = recorded["output_restart_sha256"]
+        previous_configuration = configuration
+        print(f"  REUSE {stage['name']}")
+
+    return previous_configuration
+
+
+def validate_start_predecessor_compatibility(
+    previous_configuration: dict,
+    previous_stage: dict,
+    start_stage_name: str,
+    args,
+) -> dict | None:
+    """Permit only an explicit historical duration mismatch for a restart."""
+    expected = {
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "threads": args.threads,
+        "temp_K": previous_stage["temp"],
+        "step_fs": MD_STEP_FS,
+        "dump_fs": MD_DUMP_FS,
+        "hmass": 1,
+        "shake": 0,
+        "sccacc": 1.0,
+        "restart": previous_stage["restart"],
+    }
+    mismatched = configuration_mismatches(expected, previous_configuration)
+    if mismatched:
+        raise RuntimeError(
+            f"Cannot start from {previous_stage['name']}: historical "
+            "provenance is incompatible with the requested E2 settings "
+            f"(fields: {', '.join(mismatched)})."
+        )
+
+    previous_time = previous_configuration["time_ps"]
+    if previous_time == previous_stage["time"]:
+        return None
+
+    override = {
+        "previous_stage": previous_stage["name"],
+        "historical_time_ps": previous_time,
+        "current_default_time_ps": previous_stage["time"],
+        "explicit_start_stage_override": True,
+    }
+    print(
+        f"  WARNING: starting {start_stage_name} from an existing "
+        f"{previous_stage['name']} generated with a previous stage-duration "
+        f"configuration ({previous_time:g} ps; current default "
+        f"{previous_stage['time']:g} ps)."
+    )
+    return override
+
+
 def run_replica(replica_dir: Path, args):
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.threads)
     env.setdefault("MKL_NUM_THREADS", str(args.threads))
     env.setdefault("OMP_STACKSIZE", "4G")
 
-    if (
-        args.resume_thermostat_warning
-        and not args.skip_relax
-        and not (
-            stage_archive_dir(replica_dir, "00_relax") / "stage.done"
-        ).exists()
-    ):
-        raise RuntimeError(
-            "--resume-thermostat-warning will not execute 00_relax. "
-            "A completed reusable 00_relax stage is required."
-        )
+    existing_only = args.resume or args.start_stage is not None
+    if existing_only:
+        try:
+            replica_manifest = json.loads(
+                (replica_dir / "manifest.json").read_text()
+            )
+            relaxation_enabled = replica_manifest["relaxation"]["enabled"]
+        except (OSError, json.JSONDecodeError, KeyError) as exc:
+            raise RuntimeError(
+                f"Cannot resume {replica_dir}: missing or invalid manifest.json."
+            ) from exc
+    else:
+        relaxation_enabled = not args.skip_relax
 
-    if not args.skip_relax:
+    md_start_index = 0
+    start_stage_override = None
+
+    if args.resume:
+        if relaxation_enabled:
+            relax_done = (
+                stage_archive_dir(replica_dir, "00_relax") / "stage.done"
+            )
+            if not relax_done.exists():
+                raise RuntimeError(
+                    "--resume will not execute 00_relax. A completed reusable "
+                    "00_relax stage is required."
+                )
+            run_relaxation(replica_dir, args, env)
+            print("  REUSE 00_relax")
+    elif args.start_stage is not None:
+        if args.start_stage == "00_relax":
+            if not relaxation_enabled:
+                raise RuntimeError(
+                    "Cannot start at 00_relax: this replica manifest records "
+                    "relaxation as disabled."
+                )
+            run_relaxation(replica_dir, args, env)
+        else:
+            md_start_index = next(
+                index for index, item in enumerate(STAGES)
+                if item["name"] == args.start_stage
+            )
+            if md_start_index == 0 and relaxation_enabled:
+                relax_done = (
+                    stage_archive_dir(replica_dir, "00_relax") / "stage.done"
+                )
+                if not relax_done.exists():
+                    raise RuntimeError(
+                        f"Cannot start at {args.start_stage}: a completed "
+                        "00_relax stage is required."
+                    )
+                run_relaxation(replica_dir, args, env)
+                print("  REUSE 00_relax")
+
+            previous_configuration = validate_historical_md_prefix(
+                replica_dir,
+                md_start_index,
+                args,
+            )
+            if previous_configuration is not None:
+                previous_stage = STAGES[md_start_index - 1]
+                start_stage_override = (
+                    validate_start_predecessor_compatibility(
+                        previous_configuration,
+                        previous_stage,
+                        args.start_stage,
+                        args,
+                    )
+                )
+    elif relaxation_enabled:
         run_relaxation(replica_dir, args, env)
 
     for i, stage in enumerate(STAGES):
+        if i < md_start_index:
+            continue
+
         name = stage["name"]
         input_name = f"{name}.inp"
         geometry_name = (
             "system_relaxed.pdb"
-            if i == 0 and not args.skip_relax
+            if i == 0 and relaxation_enabled
             else "system_centered.pdb"
+        )
+        validate_current_md_input(
+            replica_dir,
+            stage,
+            create_missing=(args.start_stage == name),
         )
         input_restart_sha256 = None
         if stage["restart"]:
@@ -1714,12 +2108,34 @@ def run_replica(replica_dir: Path, args):
             args=args,
         )
         archive = stage_archive_dir(replica_dir, name)
+        recovery_requested = args.resume or args.start_stage is not None
+        if recovery_requested and (archive / "stage.failed").exists():
+            historical_stage, historical_configuration = (
+                historical_md_stage_configuration(
+                    replica_dir,
+                    i,
+                    input_restart_sha256,
+                )
+            )
+            mismatched = configuration_mismatches(
+                stage_configuration,
+                historical_configuration,
+            )
+            if mismatched:
+                raise RuntimeError(
+                    f"Cannot recover {name}: historical calculation is "
+                    "incompatible with the requested protocol "
+                    f"(fields: {', '.join(mismatched)})."
+                )
+        else:
+            historical_stage = stage
+
         if recover_thermostat_warning_stage(
-            replica_dir,
-            stage,
+            historical_stage,
             archive,
             stage_configuration,
             args,
+            recovery_requested=recovery_requested,
         ):
             continue
 
@@ -1728,13 +2144,20 @@ def run_replica(replica_dir: Path, args):
             name,
             args.force,
             stage_configuration,
+            args.thermostat_warning_policy,
         )
         if already_done:
-            print(
-                f"  SKIP {replica_dir.parent.name}/"
-                f"{replica_dir.name} {name}: already completed"
-            )
+            if recovery_requested:
+                print(f"  REUSE {name}")
+            else:
+                print(
+                    f"  SKIP {replica_dir.parent.name}/"
+                    f"{replica_dir.name} {name}: already completed"
+                )
             continue
+
+        if i == md_start_index and start_stage_override is not None:
+            stage_configuration["start_stage_override"] = start_stage_override
 
         for transient in [
             "xtb.trj",
@@ -1762,6 +2185,15 @@ def run_replica(replica_dir: Path, args):
                 restart_path,
                 replica_dir / "mdrestart.input",
             )
+            if name == "04_298K_screen":
+                print(
+                    "  START 04_298K_screen from restart of "
+                    "03_298K_equil"
+                )
+                print("       previous stage: 03_298K_equil")
+                print(
+                    f"       input restart SHA256: {copied_input_hash}"
+                )
 
         log_path = replica_dir / f"{name}.out"
         cmd = xtb_command(args, geometry_name, input_name)
@@ -1809,35 +2241,6 @@ def run_replica(replica_dir: Path, args):
                 "Outputs were archived for inspection."
             )
 
-        warning_accepted = (
-            validation["thermostating_problem"]
-            and thermostat_warning_allowed(
-                args.thermostat_warning_policy,
-                name,
-            )
-        )
-        if (
-            validation["thermostating_problem"]
-            and not warning_accepted
-        ):
-            archive_failed_md_stage(
-                replica_dir,
-                name,
-                log_path,
-                "thermostating problem",
-            )
-            next_stage = (
-                STAGES[i + 1]["name"]
-                if i + 1 < len(STAGES)
-                else "pipeline completion"
-            )
-            raise RuntimeError(
-                f"{name} completed numerically but xTB reported "
-                "'thermostating problem'. Outputs were archived for "
-                f"inspection. Policy '{args.thermostat_warning_policy}' "
-                f"refuses to continue to {next_stage}."
-            )
-
         if not (replica_dir / "xtb.trj").exists():
             archive_failed_md_stage(
                 replica_dir, name, log_path, "missing xtb.trj"
@@ -1879,12 +2282,59 @@ def run_replica(replica_dir: Path, args):
                 "as complete. Outputs were archived for inspection."
             )
 
+        warning_accepted = (
+            validation["thermostating_problem"]
+            and validation["normal_exit_of_md"]
+            and thermostat_warning_allowed(
+                args.thermostat_warning_policy,
+                name,
+            )
+        )
         thermal_result = md_thermal_result(
             stage,
             validation,
             args.thermostat_warning_policy,
             warning_accepted,
         )
+        if (
+            validation["thermostating_problem"]
+            and not warning_accepted
+        ):
+            reason = (
+                "thermostating problem"
+                if validation["normal_exit_of_md"]
+                else "thermostating problem without normal exit of md()"
+            )
+            write_md_stage_manifest(
+                archive,
+                stage_configuration,
+                output_restart_sha256,
+                thermal_result,
+            )
+            archive_stage_outputs(
+                replica_dir,
+                name,
+                log_path,
+            )
+            mark_stage_failed(archive, reason)
+            next_stage = (
+                STAGES[i + 1]["name"]
+                if i + 1 < len(STAGES)
+                else "pipeline completion"
+            )
+            if not validation["normal_exit_of_md"]:
+                raise RuntimeError(
+                    f"{name} reported 'thermostating problem' without "
+                    "'normal exit of md()'. Outputs were archived; refusing "
+                    f"to continue to {next_stage}."
+                )
+            raise RuntimeError(
+                f"{name} completed numerically but xTB reported "
+                "'thermostating problem'. Outputs passed integrity checks, "
+                f"but policy '{args.thermostat_warning_policy}' refuses to "
+                f"continue to {next_stage}."
+            )
+
         write_md_stage_manifest(
             archive,
             stage_configuration,
@@ -1905,10 +2355,9 @@ def run_replica(replica_dir: Path, args):
                 else "pipeline completion"
             )
             print(
-                f"  WARNING {name}: xTB reported 'thermostating problem'; "
-                "stage completed numerically and passed output-integrity "
-                f"checks. Policy '{args.thermostat_warning_policy}' accepts "
-                f"it; continuing to {next_stage}."
+                f"  WARNING {name}: xTB reported 'thermostating problem', "
+                "but MD exited normally and all restart/output integrity "
+                f"checks passed. Continuing to {next_stage}."
             )
         else:
             print(f"  OK   {name}")
@@ -2141,20 +2590,32 @@ def parse_args():
 
     p.add_argument(
         "--thermostat-warning-policy",
-        default="ramp",
+        default="allow",
         choices=["strict", "ramp", "allow"],
         help=(
             "Policy for xTB 'thermostating problem' warnings "
-            "(default: ramp)."
+            "(default: allow after all integrity checks pass)."
         ),
     )
 
     p.add_argument(
+        "--resume",
         "--resume-thermostat-warning",
+        dest="resume",
         action="store_true",
         help=(
-            "Promote archived thermostat-warning-only failed MD stages when "
-            "their outputs and the current policy permit reuse."
+            "Resume an existing project without Packmol/preparation; validate "
+            "and reuse compatible stages, including safe promotion of a "
+            "thermostat-warning-only failed stage."
+        ),
+    )
+
+    p.add_argument(
+        "--start-stage",
+        choices=EXECUTION_STAGES,
+        help=(
+            "Start execution from an existing prepared stage. In particular, "
+            "04_298K_screen may explicitly reuse a valid historical 03 restart."
         ),
     )
 
@@ -2211,9 +2672,20 @@ def validate_args(args):
     if args.relax_cycles < 1:
         raise SystemExit("--relax-cycles must be >= 1.")
 
-    if args.resume_thermostat_warning and args.force:
+    if args.resume and args.start_stage is not None:
+        raise SystemExit("--resume cannot be combined with --start-stage.")
+
+    if (args.resume or args.start_stage is not None) and not args.run:
+        raise SystemExit("--resume/--start-stage require --run.")
+
+    if (args.resume or args.start_stage is not None) and args.force:
         raise SystemExit(
-            "--resume-thermostat-warning cannot be combined with --force."
+            "--resume/--start-stage cannot be combined with --force."
+        )
+
+    if (args.resume or args.start_stage is not None) and args.repack:
+        raise SystemExit(
+            "--resume/--start-stage cannot be combined with --repack."
         )
 
 
@@ -2222,15 +2694,7 @@ def main():
     validate_args(args)
 
     selected = select_systems(args)
-    water_pdb = find_water_pdb(args.water_pdb)
-
-    for name in selected:
-        solute = SYSTEMS[name]["solute"]
-
-        if not solute.exists():
-            raise SystemExit(
-                f"Unsolvated PDB not found for {name}:\n{solute}"
-            )
+    existing_only = args.resume or args.start_stage is not None
 
     if args.run and shutil.which(args.xtb) is None:
         raise SystemExit(
@@ -2238,40 +2702,64 @@ def main():
             "Use --xtb /path/to/xtb if necessary."
         )
 
-    if shutil.which(args.packmol) is None:
-        raise SystemExit(
-            f"Packmol executable '{args.packmol}' not found in PATH. "
-            "Use --packmol /path/to/packmol if necessary."
-        )
-
-    args.project.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
     replica_dirs = []
 
-    print(f"Water template: {water_pdb}")
     print(f"Output project: {args.project}")
     print(f"Replicas/system: {args.replicas}")
 
-    for system_name in selected:
-        solute = SYSTEMS[system_name]["solute"]
+    if existing_only:
+        if not args.project.is_dir():
+            raise SystemExit(
+                f"Existing project directory not found: {args.project}"
+            )
+        for system_name in selected:
+            for replica_index in range(1, args.replicas + 1):
+                replica_dir = (
+                    args.project
+                    / system_name
+                    / f"replica_{replica_index:02d}"
+                )
+                if not replica_dir.is_dir():
+                    raise SystemExit(
+                        f"Existing replica directory not found: {replica_dir}"
+                    )
+                if not (replica_dir / "manifest.json").is_file():
+                    raise SystemExit(
+                        f"Existing replica has no manifest.json: {replica_dir}"
+                    )
+                replica_dirs.append(replica_dir)
+        print("Existing-only mode: Packmol and preparation are not run.")
+    else:
+        water_pdb = find_water_pdb(args.water_pdb)
+        print(f"Water template: {water_pdb}")
 
-        for replica_index in range(
-            1,
-            args.replicas + 1,
-        ):
-            replica_dir = prepare_replica(
-                system_name=system_name,
-                solute_pdb=solute,
-                water_pdb=water_pdb,
-                replica_index=replica_index,
-                project_dir=args.project,
-                args=args,
+        for name in selected:
+            solute = SYSTEMS[name]["solute"]
+            if not solute.exists():
+                raise SystemExit(
+                    f"Unsolvated PDB not found for {name}:\n{solute}"
+                )
+
+        if shutil.which(args.packmol) is None:
+            raise SystemExit(
+                f"Packmol executable '{args.packmol}' not found in PATH. "
+                "Use --packmol /path/to/packmol if necessary."
             )
 
-            replica_dirs.append(replica_dir)
+        args.project.mkdir(parents=True, exist_ok=True)
+
+        for system_name in selected:
+            solute = SYSTEMS[system_name]["solute"]
+            for replica_index in range(1, args.replicas + 1):
+                replica_dir = prepare_replica(
+                    system_name=system_name,
+                    solute_pdb=solute,
+                    water_pdb=water_pdb,
+                    replica_index=replica_index,
+                    project_dir=args.project,
+                    args=args,
+                )
+                replica_dirs.append(replica_dir)
 
     if args.run:
         print("\nStarting xTB relaxation + MD E2 pipeline...")
