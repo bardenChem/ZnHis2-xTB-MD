@@ -269,10 +269,114 @@ The times in ps are the source of truth; step counts above are derived from the
 0.5 fs timestep. GFN2-xTB remains the default, with physical H masses and SHAKE
 off.
 
+## Trajectory analysis and diagnostic plots
+
+`xtb_analysis.py` reads archived `xtb.trj` files, calculates structural
+descriptors, writes reusable CSV/JSON tables, and generates headless Matplotlib
+plots. Plotting is enabled by default.
+
+The trajectory parser accepts both coordinate-only extended XYZ frames and the
+xTB layout in which each coordinate block is followed by one three-component
+velocity record per atom. Velocities are preserved in `Frame.velocities`, while
+`frames.csv` and `analysis_metadata.json` record their presence. They are not
+used in the current structural analyses, no physical unit is assigned, and
+`trajectory_for_travis.xyz` continues to contain coordinates only.
+
+Analyze the default screening stage of one replica:
+
+```bash
+python3 xtb_analysis.py \
+    --replica md_screening/O6_I/replica_01 \
+    --stage 04_298K_screen \
+    --discard-first-ps 1.0 \
+    --output-dir analysis/O6_I
+```
+
+Run numerical analysis without loading Matplotlib or creating graphics:
+
+```bash
+python3 xtb_analysis.py \
+    --replica md_screening/O6_I/replica_01 \
+    --stage 04_298K_screen \
+    --discard-first-ps 1.0 \
+    --output-dir analysis/O6_I \
+    --no-plots
+```
+
+Named coordination sites use one-based atom indices. The values below are
+placeholders: replace every `<INDEX>` after checking the replica PDB or a first
+run's `atoms.csv`.
+
+```bash
+python3 xtb_analysis.py \
+    --replica md_screening/O6_I/replica_01 \
+    --stage 04_298K_screen \
+    --discard-first-ps 1.0 \
+    --site Nam1:<INDEX>:N \
+    --site Ndelta1:<INDEX>:N \
+    --site Ocarb1:<INDEX>:Ocarb \
+    --site Nam2:<INDEX>:N \
+    --site Ndelta2:<INDEX>:N \
+    --site Ocarb2:<INDEX>:Ocarb \
+    --output-dir analysis/O6_I
+```
+
+The plotting options are:
+
+```text
+--no-plots
+--plot-format {png,pdf,svg}   default: png
+--plot-dpi 300                PNG resolution
+--plot-dir PATH               default: <output-dir>/plots
+```
+
+Outputs are conditional on the available data and requested analyses:
+
+```text
+analysis/O6_I/
+├── atoms.csv
+├── frames.csv
+├── distance_summary.csv
+├── Zn_Owater_radial_number.csv
+├── coordination_states.csv
+├── water_contact_events.csv
+├── solute_RMSF.csv
+├── analysis_metadata.json
+├── trajectory_for_travis.xyz
+└── plots/
+    ├── coordination_distances_vs_time.png
+    ├── Zn_<group>_distances_vs_time.png
+    ├── nearest_water_vs_time.png
+    ├── coordination_number_vs_time.png
+    ├── smooth_coordination_number_vs_time.png
+    ├── coordination_state_vs_time.png
+    ├── coordination_state_fraction.png
+    ├── Zn_Owater_shell_count.png
+    ├── Zn_Owater_cumulative_N.png
+    ├── solute_RMSD_vs_time.png
+    ├── solute_RMSF.png
+    ├── tetrahedrality_vs_time.png
+    ├── energy_vs_time.png
+    ├── gnorm_vs_time.png
+    └── distributions/
+        ├── Zn_<site>_distance_histogram.png
+        ├── nearest_water_distance_histogram.png
+        ├── CN_smooth_histogram.png
+        └── tetrahedrality_histogram.png
+```
+
+Hard coordination numbers and states are calculated only when the user supplies
+`--contact-cutoff-A`; the program does not assume a universal chemical cutoff.
+The radial outputs are finite-droplet shell counts and cumulative `N(r)`, not a
+bulk-normalized RDF or `g(r)`. State fractions and histograms from these short
+screening trajectories are descriptive, not converged equilibrium populations.
+See [`xtb_analysis_USAGE.md`](xtb_analysis_USAGE.md) for the remaining analysis
+options and multi-stage examples.
+
 ## Scope boundary
 
-This script is deliberately limited to E2 preparation/screening.
+`xtb_md_pipeline.py` is deliberately limited to E2 preparation/screening.
 
-A later analysis-oriented program can consume the stable directory layout and
-control TRAVIS, coordination analysis, clustering and E2->E3/E4 selection without
-mixing simulation execution with analysis logic.
+`xtb_analysis.py` consumes the stable directory layout without mixing simulation
+execution with analysis logic. More advanced analysis, clustering, and E2->E3/E4
+selection remain future work intended for integration with OOCCuPy.
