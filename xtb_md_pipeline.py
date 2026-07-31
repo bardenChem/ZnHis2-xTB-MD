@@ -149,6 +149,12 @@ FATAL_MD_PATTERNS = [
     "floating point exception",
 ]
 
+LEGACY_MDRESTART_COUNT_ERROR = re.compile(
+    r"^invalid mdrestart atom count:\s*"
+    r"found\s+(\d+),\s*expected\s+(\d+)\s*$",
+    flags=re.IGNORECASE,
+)
+
 FATAL_XTB_PATTERNS = [
     "emergency exit",
     "Runtime exception",
@@ -1136,6 +1142,210 @@ def stage_archive_dir(replica_dir: Path, stage_name: str) -> Path:
     return replica_dir / "stages" / stage_name
 
 
+def validate_historical_relaxation(replica_dir: Path):
+    """Validate a completed relaxation against its own historical records."""
+    archive = stage_archive_dir(replica_dir, "00_relax")
+    done = archive / "stage.done"
+    if not done.is_file():
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: missing {done}."
+        )
+    failed = archive / "stage.failed"
+    if failed.exists():
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: conflicting stage.done and "
+            f"stage.failed markers exist in {archive}."
+        )
+
+    manifest_path = replica_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: missing or invalid "
+            f"{manifest_path}."
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(
+            f"Cannot reuse historical 00_relax: invalid {manifest_path}."
+        )
+
+    relaxation = manifest.get("relaxation")
+    if not isinstance(relaxation, dict):
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: manifest relaxation record "
+            "is missing or invalid."
+        )
+    if relaxation.get("enabled") is not True:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: manifest records "
+            "relaxation.enabled != true."
+        )
+
+    relaxation_result = manifest.get("relaxation_result")
+    configuration = (
+        relaxation_result.get("configuration")
+        if isinstance(relaxation_result, dict)
+        else None
+    )
+    if not isinstance(configuration, dict) or not configuration:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: "
+            "relaxation_result.configuration is missing or invalid."
+        )
+
+    centered_pdb = replica_dir / "system_centered.pdb"
+    relaxed_pdb = replica_dir / "system_relaxed.pdb"
+    for geometry in (centered_pdb, relaxed_pdb):
+        if not geometry.is_file():
+            raise RuntimeError(
+                f"Cannot reuse historical 00_relax: missing {geometry}."
+            )
+
+    try:
+        geometry_record = manifest["geometry_after_centering"]
+        wall_record = manifest["wall"]
+        xtb_record = manifest["xtb"]
+        n_total = geometry_record["n_atoms"]
+        n_solute = relaxation["n_solute_atoms"]
+        fixed_atoms = relaxation["fixed_atoms"]
+        relaxation_gfn = relaxation["gfn"]
+        optimization_level = relaxation["optimization_level"]
+        optimization_engine = relaxation.get(
+            "optimization_engine", "auto"
+        )
+        max_cycles = relaxation["max_cycles"]
+        wall_radius_bohr = wall_record["radius_bohr"]
+        xtb_gfn = xtb_record["gfn"]
+        charge = xtb_record["charge"]
+        uhf = xtb_record["uhf"]
+        alpb = xtb_record["alpb"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: required historical manifest "
+            f"field is missing or invalid ({exc})."
+        ) from exc
+
+    if (
+        not isinstance(n_total, int)
+        or isinstance(n_total, bool)
+        or n_total < 1
+        or not isinstance(n_solute, int)
+        or isinstance(n_solute, bool)
+        or not 1 <= n_solute <= n_total
+    ):
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: invalid historical atom "
+            f"counts (n_atoms={n_total!r}, n_solute_atoms={n_solute!r})."
+        )
+
+    expected_fixed_atoms = f"1-{n_solute}"
+    if fixed_atoms != expected_fixed_atoms:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: relaxation.fixed_atoms "
+            f"is {fixed_atoms!r}, expected {expected_fixed_atoms!r} from "
+            "relaxation.n_solute_atoms."
+        )
+    if configuration.get("fixed_atoms") != fixed_atoms:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: configuration.fixed_atoms "
+            "does not match relaxation.fixed_atoms."
+        )
+
+    try:
+        centered_atoms = pdb_atoms(centered_pdb)
+        relaxed_atoms = pdb_atoms(relaxed_pdb)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: invalid historical geometry "
+            f"({exc})."
+        ) from exc
+    if len(centered_atoms) != n_total:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_centered.pdb has "
+            f"{len(centered_atoms)} atoms, expected {n_total}."
+        )
+    if len(relaxed_atoms) != n_total:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_relaxed.pdb has "
+            f"{len(relaxed_atoms)} atoms, expected {n_total}."
+        )
+    for geometry_name, atoms in (
+        ("system_centered.pdb", centered_atoms),
+        ("system_relaxed.pdb", relaxed_atoms),
+    ):
+        if any(
+            not all(math.isfinite(value) for value in atom["xyz"])
+            for atom in atoms
+        ):
+            raise RuntimeError(
+                "Cannot reuse historical 00_relax: "
+                f"{geometry_name} contains non-finite coordinates."
+            )
+    if [
+        atom["element"] for atom in centered_atoms
+    ] != [
+        atom["element"] for atom in relaxed_atoms
+    ]:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: element sequence differs "
+            "between system_centered.pdb and system_relaxed.pdb."
+        )
+
+    centered_sha256 = file_sha256(centered_pdb)
+    if configuration.get("input_sha256") != centered_sha256:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: system_centered.pdb SHA-256 "
+            "does not match configuration.input_sha256."
+        )
+
+    if relaxation_gfn != xtb_gfn:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: relaxation.gfn does not "
+            "match xtb.gfn."
+        )
+
+    expected_configuration = {
+        "gfn": xtb_gfn,
+        "charge": charge,
+        "uhf": uhf,
+        "alpb": alpb,
+        "optimization_level": optimization_level,
+        "optimization_engine": optimization_engine,
+        "max_cycles": max_cycles,
+        "wall_radius_bohr": wall_radius_bohr,
+    }
+    historical_configuration = dict(configuration)
+    # Results predating --relax-engine used xTB's default engine selection.
+    historical_configuration.setdefault("optimization_engine", "auto")
+    mismatches = [
+        field
+        for field, expected in expected_configuration.items()
+        if historical_configuration.get(field) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: historical configuration "
+            "does not match the manifest (fields: "
+            + ", ".join(mismatches)
+            + ")."
+        )
+
+    displacement = solute_displacement(
+        centered_pdb,
+        relaxed_pdb,
+        n_solute,
+    )
+    if displacement["solute_max_displacement_A"] > 1.0e-3:
+        raise RuntimeError(
+            "Cannot reuse historical 00_relax: fixed solute atoms moved by "
+            f"{displacement['solute_max_displacement_A']:.6f} A, exceeding "
+            "the 0.001 A tolerance."
+        )
+
+    print("  REUSE 00_relax")
+
+
 def restore_restart_from_previous(
     replica_dir: Path,
     stage_index: int,
@@ -1607,31 +1817,60 @@ def restart_atom_count(replica_dir: Path) -> int:
     return count
 
 
-def validate_output_restart(
-    output_restart: Path,
-    input_restart_sha256: str | None,
-    *,
-    expected_atoms: int,
-) -> str:
-    if not output_restart.is_file():
+def parse_mdrestart(path: Path, expected_atoms: int) -> dict:
+    """Validate xTB mdrestart records without changing the original file."""
+    if not path.is_file():
         raise RuntimeError("missing mdrestart")
-    if output_restart.stat().st_size == 0:
+    if path.stat().st_size == 0:
         raise RuntimeError("empty mdrestart")
-    rows = [
-        line.split()
-        for line in output_restart.read_text(errors="replace").splitlines()
+
+    records = [
+        (line_number, line.split())
+        for line_number, line in enumerate(
+            path.read_text(errors="replace").splitlines(),
+            start=1,
+        )
         if line.strip()
     ]
-    if len(rows) != expected_atoms:
+    if not records:
+        raise RuntimeError("empty mdrestart")
+
+    control_records = 0
+    first_line_number, first_fields = records[0]
+    if len(first_fields) == 1:
+        try:
+            control_value = float(
+                first_fields[0].replace("D", "E").replace("d", "e")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid mdrestart control record at line "
+                f"{first_line_number}: non-numeric value"
+            ) from exc
+        if not math.isfinite(control_value):
+            raise RuntimeError(
+                f"invalid mdrestart control record at line "
+                f"{first_line_number}: non-finite value"
+            )
+        control_records = 1
+
+    atom_rows = records[control_records:]
+    atom_records = len(atom_rows)
+    if atom_records != expected_atoms:
         raise RuntimeError(
-            f"invalid mdrestart atom count: found {len(rows)}, "
-            f"expected {expected_atoms}"
+            f"invalid mdrestart atom count: found {atom_records} atom "
+            f"records, expected {expected_atoms}"
         )
-    for row_index, fields in enumerate(rows, start=1):
+
+    for atom_index, (line_number, fields) in enumerate(
+        atom_rows,
+        start=1,
+    ):
         if len(fields) != 6:
             raise RuntimeError(
-                f"invalid mdrestart row {row_index}: expected 6 numeric "
-                f"columns, found {len(fields)}"
+                f"invalid mdrestart atom record {atom_index} at line "
+                f"{line_number}: expected 6 numeric columns, "
+                f"found {len(fields)}"
             )
         try:
             values = [
@@ -1640,12 +1879,30 @@ def validate_output_restart(
             ]
         except ValueError as exc:
             raise RuntimeError(
-                f"invalid mdrestart row {row_index}: non-numeric value"
+                f"invalid mdrestart atom record {atom_index} at line "
+                f"{line_number}: non-numeric value"
             ) from exc
         if not all(math.isfinite(value) for value in values):
             raise RuntimeError(
-                f"invalid mdrestart row {row_index}: non-finite value"
+                f"invalid mdrestart atom record {atom_index} at line "
+                f"{line_number}: non-finite value"
             )
+
+    return {
+        "control_records": control_records,
+        "atom_records": atom_records,
+        "expected_atoms": expected_atoms,
+        "valid": True,
+    }
+
+
+def validate_output_restart(
+    output_restart: Path,
+    input_restart_sha256: str | None,
+    *,
+    expected_atoms: int,
+) -> str:
+    parse_mdrestart(output_restart, expected_atoms)
     output_sha256 = file_sha256(output_restart)
     if (
         input_restart_sha256 is not None
@@ -1655,6 +1912,194 @@ def validate_output_restart(
             "output mdrestart is byte-identical to input mdrestart"
         )
     return output_sha256
+
+
+def recover_legacy_restart_validation_failure(
+    stage: dict,
+    archive: Path,
+    configuration: dict,
+    args,
+    recovery_requested: bool,
+) -> bool:
+    """Promote only the known control-record atom-count false positive."""
+    failed = archive / "stage.failed"
+    if not recovery_requested or not failed.exists():
+        return False
+
+    stage_name = stage["name"]
+    if (archive / "stage.done").exists():
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archive contains both stage.done "
+            "and stage.failed."
+        )
+
+    reason = failed.read_text(errors="replace").strip()
+    reason_match = LEGACY_MDRESTART_COUNT_ERROR.fullmatch(reason)
+    if reason_match is None:
+        return False
+
+    old_found = int(reason_match.group(1))
+    old_expected = int(reason_match.group(2))
+    expected_atoms = restart_atom_count(archive.parent.parent)
+    if old_expected != expected_atoms or old_found != expected_atoms + 1:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: legacy atom-count reason is "
+            "inconsistent with the current replica manifest."
+        )
+
+    required = ["xtb.trj", "mdrestart", "xtbmdok", f"{stage_name}.out"]
+    if stage["restart"]:
+        required.append("mdrestart.input")
+    missing = [name for name in required if not (archive / name).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived outputs are incomplete "
+            f"(missing: {', '.join(missing)})."
+        )
+
+    log_path = archive / f"{stage_name}.out"
+    validation = inspect_md_log(log_path)
+    if validation["fatal_patterns"]:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived log contains fatal "
+            f"pattern(s): {', '.join(validation['fatal_patterns'])}."
+        )
+    warning_accepted = (
+        validation["thermostating_problem"]
+        and validation["normal_exit_of_md"]
+        and thermostat_warning_allowed(
+            args.thermostat_warning_policy,
+            stage_name,
+        )
+    )
+    if validation["thermostating_problem"] and not warning_accepted:
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived log has an unaccepted "
+            "thermostating problem."
+        )
+
+    manifest_path = archive / "stage_manifest.json"
+    had_stage_manifest = manifest_path.exists()
+    if had_stage_manifest:
+        try:
+            recorded = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: unreadable "
+                "stage_manifest.json."
+            ) from exc
+        mismatched = configuration_mismatches(configuration, recorded)
+        if mismatched:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived configuration is "
+                f"incompatible (fields: {', '.join(mismatched)})."
+            )
+        if recorded.get("returncode") != 0:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived return code is "
+                f"{recorded.get('returncode')}."
+            )
+
+    input_restart_sha256 = configuration["input_restart_sha256"]
+    if stage["restart"]:
+        archived_input_hash = file_sha256(archive / "mdrestart.input")
+        if archived_input_hash != input_restart_sha256:
+            raise RuntimeError(
+                f"Cannot recover {stage_name}: archived input restart does "
+                "not match the currently valid previous stage."
+            )
+
+    restart_metadata = parse_mdrestart(
+        archive / "mdrestart",
+        expected_atoms,
+    )
+    if (
+        restart_metadata["control_records"] != 1
+        or old_found
+        != (
+            restart_metadata["control_records"]
+            + restart_metadata["atom_records"]
+        )
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived mdrestart does not match "
+            "the legacy control-record false-positive signature."
+        )
+    output_restart_sha256 = validate_output_restart(
+        archive / "mdrestart",
+        input_restart_sha256,
+        expected_atoms=expected_atoms,
+    )
+    if (
+        had_stage_manifest
+        and recorded.get("output_restart_sha256")
+        != output_restart_sha256
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: output restart hash is "
+            "inconsistent with stage_manifest.json."
+        )
+
+    archived_input = archive / f"{stage_name}.inp"
+    if (
+        archived_input.exists()
+        and file_sha256(archived_input)
+        != configuration["xtb_input_sha256"]
+    ):
+        raise RuntimeError(
+            f"Cannot recover {stage_name}: archived xTB input hash is "
+            "inconsistent with historical provenance."
+        )
+
+    thermal_result = md_thermal_result(
+        stage,
+        validation,
+        args.thermostat_warning_policy,
+        warning_accepted,
+    )
+    write_md_stage_manifest(
+        archive,
+        configuration,
+        output_restart_sha256,
+        thermal_result,
+        returncode=0,
+        recovery={
+            "promoted_from_stage_failed": True,
+            "original_failure_reason": reason,
+            "reason": (
+                "legacy parser counted mdrestart control record as an atom"
+            ),
+            "mdrestart_control_records": (
+                restart_metadata["control_records"]
+            ),
+            "mdrestart_atom_records": restart_metadata["atom_records"],
+            "xtb_recalculated": False,
+            "configuration_source": (
+                "existing stage_manifest.json"
+                if had_stage_manifest
+                else (
+                    "legacy manifest.json plus deterministic stage input "
+                    "and archived restart/output chain"
+                )
+            ),
+            "returncode_evidence": (
+                "recorded returncode == 0"
+                if had_stage_manifest
+                else (
+                    "legacy restart-validation stage.failed marker was "
+                    "created only after returncode == 0"
+                )
+            ),
+        },
+    )
+    mark_stage_done(archive)
+    print(
+        f"  RECOVER {stage_name}: legacy mdrestart validation false "
+        f"positive; {restart_metadata['control_records']} control record + "
+        f"{restart_metadata['atom_records']} atom records; archived MD "
+        "outputs passed integrity checks; no xTB recalculation performed."
+    )
+    return True
 
 
 def recover_thermostat_warning_stage(
@@ -1810,6 +2255,30 @@ def recover_thermostat_warning_stage(
         "only; outputs passed integrity checks and current policy accepts it."
     )
     return True
+
+
+def recover_failed_md_stage(
+    stage: dict,
+    archive: Path,
+    configuration: dict,
+    args,
+    recovery_requested: bool,
+) -> bool:
+    if recover_legacy_restart_validation_failure(
+        stage,
+        archive,
+        configuration,
+        args,
+        recovery_requested,
+    ):
+        return True
+    return recover_thermostat_warning_stage(
+        stage,
+        archive,
+        configuration,
+        args,
+        recovery_requested,
+    )
 
 
 def prepare_md_stage_attempt(
@@ -2023,7 +2492,7 @@ def validate_historical_md_prefix(
             args,
         )
         archive = stage_archive_dir(replica_dir, stage["name"])
-        recover_thermostat_warning_stage(
+        recover_failed_md_stage(
             stage,
             archive,
             configuration,
@@ -2135,15 +2604,7 @@ def run_replica(replica_dir: Path, args):
 
     if args.resume:
         if relaxation_enabled:
-            relax_done = (
-                stage_archive_dir(replica_dir, "00_relax") / "stage.done"
-            )
-            if not relax_done.exists():
-                raise RuntimeError(
-                    "--resume will not execute 00_relax. A completed reusable "
-                    "00_relax stage is required."
-                )
-            run_relaxation(replica_dir, args, env)
+            validate_historical_relaxation(replica_dir)
     elif args.start_stage is not None:
         if args.start_stage == "00_relax":
             if not relaxation_enabled:
@@ -2157,16 +2618,8 @@ def run_replica(replica_dir: Path, args):
                 index for index, item in enumerate(STAGES)
                 if item["name"] == args.start_stage
             )
-            if md_start_index == 0 and relaxation_enabled:
-                relax_done = (
-                    stage_archive_dir(replica_dir, "00_relax") / "stage.done"
-                )
-                if not relax_done.exists():
-                    raise RuntimeError(
-                        f"Cannot start at {args.start_stage}: a completed "
-                        "00_relax stage is required."
-                    )
-                run_relaxation(replica_dir, args, env)
+            if relaxation_enabled:
+                validate_historical_relaxation(replica_dir)
 
             previous_configuration = validate_historical_md_prefix(
                 replica_dir,
@@ -2246,7 +2699,7 @@ def run_replica(replica_dir: Path, args):
         else:
             historical_stage = stage
 
-        if recover_thermostat_warning_stage(
+        if recover_failed_md_stage(
             historical_stage,
             archive,
             stage_configuration,
