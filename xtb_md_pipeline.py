@@ -167,6 +167,7 @@ EXTENDED_STAGE_INDEX = CORE_STAGE_COUNT
 EXTENDED_STAGE = STAGES[EXTENDED_STAGE_INDEX]
 EXTENDED_STAGE_NAME = EXTENDED_STAGE["name"]
 EXECUTION_STAGES = ["00_relax", *(stage["name"] for stage in STAGES)]
+EXECUTION_PROVENANCE_ONLY_FIELDS = frozenset({"threads"})
 
 FATAL_MD_PATTERNS = [
     "MD is unstable",
@@ -1648,9 +1649,10 @@ def ensure_extended_stage_registered(replica_dir: Path):
 
 
 def configuration_mismatches(expected: dict, recorded: dict) -> list[str]:
-    """Return physical/provenance fields that differ from the expectation."""
+    """Return compatibility differences, excluding execution-only metadata."""
     return [
         key for key, expected_value in expected.items()
+        if key not in EXECUTION_PROVENANCE_ONLY_FIELDS
         if recorded.get(key) != expected_value
     ]
 
@@ -2899,7 +2901,6 @@ def validate_historical_stage_compatibility(
         "charge": args.charge,
         "uhf": args.uhf,
         "alpb": args.alpb,
-        "threads": args.threads,
         "temp_K": current_stage["temp"],
         "step_fs": MD_STEP_FS,
         "dump_fs": MD_DUMP_FS,
@@ -3013,7 +3014,6 @@ def validate_extended_stage_preconditions(
         "charge": args.charge,
         "uhf": args.uhf,
         "alpb": args.alpb,
-        "threads": args.threads,
         "temp_K": EXTENDED_STAGE["temp"],
         "time_ps": STAGES[CORE_STAGE_COUNT - 1]["time"],
         "step_fs": MD_STEP_FS,
@@ -3089,6 +3089,11 @@ def validate_extended_stage_preconditions(
         "estimated_trajectory_bytes": estimated_trajectory_bytes,
         "required_free_bytes": required_free_bytes,
         "free_bytes": free_bytes,
+        "previous_stage_threads": previous_configuration.get("threads"),
+        "requested_stage_threads": args.threads,
+        "thread_count_changed": (
+            previous_configuration.get("threads") != args.threads
+        ),
     }
 
 
@@ -3111,6 +3116,10 @@ def print_extended_dry_run(replica_dir: Path, args, preflight: dict):
     print(f"  Time step: {MD_STEP_FS:.1f} fs")
     print(f"  Steps: {md_step_count(stage)}")
     print(f"  Dump interval: {MD_DUMP_FS:.1f} fs")
+    print(
+        f"  Threads: {args.threads} "
+        f"(previous stage: {preflight['previous_stage_threads']})"
+    )
     print("  Randomize velocities: no")
     print("  Solvation rebuilt: no")
     print(f"  Command: {' '.join(cmd)}")
@@ -3775,7 +3784,11 @@ def parse_args():
         "--threads",
         type=int,
         default=8,
-        help="OMP threads per xTB run (default: 8).",
+        help=(
+            "OMP threads for each new xTB run; recorded as execution "
+            "provenance but not used to invalidate historical stages "
+            "(default: 8)."
+        ),
     )
 
     p.add_argument(

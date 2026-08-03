@@ -150,16 +150,16 @@ spherical wall. It uses `restart=true`, so coordinates and velocities come
 directly from `stages/04_298K_screen/mdrestart`; no packing, optimization,
 temperature ramp, velocity randomization, or solvation rebuild is performed.
 
-For the currently completed `replica_01` data, whose manifests record 25
-threads, validate all three priority systems without writing files or calling
-xTB:
+For the currently completed `replica_01` data, whose historical manifests
+record 25 threads, the new stage may use a different allocation. For example,
+validate a 32-thread continuation without writing files or calling xTB:
 
 ```bash
 python3 xtb_md_pipeline.py \
     --system O6_I T4_cristal T4_IV_Hudecova \
     --project md_screening \
     --replicas 1 \
-    --threads 25 \
+    --threads 32 \
     --start-stage 05_298K_extended \
     --dry-run
 ```
@@ -171,7 +171,7 @@ python3 xtb_md_pipeline.py \
     --system O6_I T4_cristal T4_IV_Hudecova \
     --project md_screening \
     --replicas 1 \
-    --threads 25 \
+    --threads 32 \
     --start-stage 05_298K_extended \
     --run
 ```
@@ -180,15 +180,17 @@ Individual commands use the same interface:
 
 ```bash
 python3 xtb_md_pipeline.py --system O6_I --project md_screening \
-    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+    --replicas 1 --threads 32 --start-stage 05_298K_extended --run
 python3 xtb_md_pipeline.py --system T4_cristal --project md_screening \
-    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+    --replicas 1 --threads 32 --start-stage 05_298K_extended --run
 python3 xtb_md_pipeline.py --system T4_IV_Hudecova --project md_screening \
-    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+    --replicas 1 --threads 32 --start-stage 05_298K_extended --run
 ```
 
-Use the exact thread count and other physical settings recorded by each
-existing replica manifest; provenance mismatches abort. A valid stage-05
+`--threads` applies to the new xTB execution and may differ from stages 01--04.
+Both the historical and newly requested counts remain recorded as execution
+provenance, but thread count is not a scientific compatibility condition. All
+physical settings must still match; those mismatches abort. A valid stage-05
 `stage.done` is reused by default. `stage.failed`, `stage.running`, or an
 unmarked nonempty archive aborts without overwriting it. To deliberately retry
 only stage 05 while retaining stage 04, add `--force` to the stage-05 command.
