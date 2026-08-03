@@ -16,7 +16,8 @@ Current scope
       02_200K        2.0 ps intermediate heating (not production)
       03_298K_equil  3.0 ps final-temperature equilibration
       04_298K_screen 5.0 ps
-6. Optionally runs xTB sequentially, chaining stages through mdrrestart.
+      05_298K_extended 20.0 ps opt-in continuation at 298.15 K
+6. Optionally runs xTB sequentially, chaining stages through mdrestart.
 7. Archives trajectories, logs, restart files and snapshots per stage.
 
 Default Hamiltonian
@@ -35,6 +36,7 @@ older Packmol versions that do not support the newer `pbc` keyword.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -42,6 +44,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from typing import Iterable
@@ -137,8 +140,32 @@ STAGES = [
         "restart": True,
         "purpose": "Structural screening at 298.15 K.",
     },
+    {
+        "name": "05_298K_extended",
+        "temp": 298.15,
+        "time": 20.0,
+        "steps": 40000,
+        "restart": True,
+        "restart_from": "04_298K_screen",
+        "preserve_velocities": True,
+        "continuation": True,
+        "continuation_of": "04_298K_screen",
+        "coordinates_reinitialized": False,
+        "velocities_reinitialized": False,
+        "solvation_rebuilt": False,
+        "temperature_ramp_applied": False,
+        "cumulative_nominal_time_ps": 25.0,
+        "purpose": (
+            "Opt-in continuation of the final 04_298K_screen restart at "
+            "298.15 K; not run by the default pipeline."
+        ),
+    },
 ]
 
+CORE_STAGE_COUNT = 4
+EXTENDED_STAGE_INDEX = CORE_STAGE_COUNT
+EXTENDED_STAGE = STAGES[EXTENDED_STAGE_INDEX]
+EXTENDED_STAGE_NAME = EXTENDED_STAGE["name"]
 EXECUTION_STAGES = ["00_relax", *(stage["name"] for stage in STAGES)]
 
 FATAL_MD_PATTERNS = [
@@ -670,6 +697,11 @@ def md_step_count(stage: dict) -> int:
         raise ValueError(
             f"Stage {stage['name']} time ({stage['time']} ps) is not an "
             f"integral number of {MD_STEP_FS} fs steps."
+        )
+    if "steps" in stage and stage["steps"] != steps:
+        raise ValueError(
+            f"Stage {stage['name']} records {stage['steps']} steps, but "
+            f"{stage['time']} ps at {MD_STEP_FS} fs requires {steps}."
         )
     return steps
 
@@ -1483,6 +1515,9 @@ def archive_stage_outputs(
 
 
 def mark_stage_done(archive: Path):
+    running = archive / "stage.running"
+    if running.exists():
+        running.unlink()
     failed = archive / "stage.failed"
     if failed.exists():
         failed.unlink()
@@ -1490,11 +1525,19 @@ def mark_stage_done(archive: Path):
 
 
 def mark_stage_failed(archive: Path, reason: str):
+    running = archive / "stage.running"
+    if running.exists():
+        running.unlink()
     done = archive / "stage.done"
     if done.exists():
         done.unlink()
     archive.mkdir(parents=True, exist_ok=True)
     (archive / "stage.failed").write_text(reason.rstrip() + "\n")
+
+
+def mark_stage_running(archive: Path, metadata: dict):
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "stage.running").write_text(json.dumps(metadata, indent=2))
 
 
 def md_stage_configuration(
@@ -1506,7 +1549,7 @@ def md_stage_configuration(
     args,
 ) -> dict:
     manifest = json.loads((replica_dir / "manifest.json").read_text())
-    return {
+    configuration = {
         "stage": stage["name"],
         "gfn": args.gfn,
         "charge": args.charge,
@@ -1529,6 +1572,79 @@ def md_stage_configuration(
         "xtb_input_sha256": file_sha256(replica_dir / input_name),
         "input_restart_sha256": input_restart_sha256,
     }
+    if stage["name"] == EXTENDED_STAGE_NAME:
+        configuration.update({
+            "steps": md_step_count(stage),
+            "restart_from": stage["restart_from"],
+            "preserve_velocities": stage["preserve_velocities"],
+            "continuation": stage["continuation"],
+            "continuation_of": stage["continuation_of"],
+            "coordinates_reinitialized": (
+                stage["coordinates_reinitialized"]
+            ),
+            "velocities_reinitialized": stage["velocities_reinitialized"],
+            "solvation_rebuilt": stage["solvation_rebuilt"],
+            "temperature_ramp_applied": (
+                stage["temperature_ramp_applied"]
+            ),
+            "cumulative_nominal_time_ps": (
+                stage["cumulative_nominal_time_ps"]
+            ),
+            "nvt": True,
+            "velocity_output": True,
+            "randomize_velocities": False,
+            "input_restart_path": str(
+                Path("stages") / stage["restart_from"] / "mdrestart"
+            ),
+        })
+    return configuration
+
+
+def ensure_extended_stage_registered(replica_dir: Path):
+    """Append the opt-in stage definition without rewriting prior stages."""
+    manifest_path = replica_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        md = manifest["md"]
+        recorded_stages = md["stages"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Cannot register {EXTENDED_STAGE_NAME} in {manifest_path}."
+        ) from exc
+
+    if not isinstance(recorded_stages, list):
+        raise RuntimeError(
+            f"Cannot register {EXTENDED_STAGE_NAME}: md.stages is not a list "
+            f"in {manifest_path}."
+        )
+    if md.get("step_fs") != MD_STEP_FS or md.get("dump_fs") != MD_DUMP_FS:
+        raise RuntimeError(
+            f"Cannot register {EXTENDED_STAGE_NAME}: manifest timestep/dump "
+            "does not match the continuation protocol."
+        )
+
+    matches = [
+        item for item in recorded_stages
+        if isinstance(item, dict) and item.get("name") == EXTENDED_STAGE_NAME
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Cannot register {EXTENDED_STAGE_NAME}: duplicate definitions "
+            f"exist in {manifest_path}."
+        )
+    if matches:
+        mismatched = configuration_mismatches(EXTENDED_STAGE, matches[0])
+        if mismatched:
+            raise RuntimeError(
+                f"Existing {EXTENDED_STAGE_NAME} definition is incompatible "
+                f"(fields: {', '.join(mismatched)})."
+            )
+        return False
+
+    recorded_stages.append(dict(EXTENDED_STAGE))
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"  REGISTER {EXTENDED_STAGE_NAME} in manifest.json")
+    return True
 
 
 def configuration_mismatches(expected: dict, recorded: dict) -> list[str]:
@@ -1602,6 +1718,33 @@ def historical_md_stage_configuration(
             "xtb_input_sha256": file_sha256(input_path),
             "input_restart_sha256": input_restart_sha256,
         }
+        if stage["name"] == EXTENDED_STAGE_NAME:
+            configuration.update({
+                "steps": md_step_count(stage),
+                "restart_from": stage["restart_from"],
+                "preserve_velocities": stage["preserve_velocities"],
+                "continuation": stage["continuation"],
+                "continuation_of": stage["continuation_of"],
+                "coordinates_reinitialized": (
+                    stage["coordinates_reinitialized"]
+                ),
+                "velocities_reinitialized": (
+                    stage["velocities_reinitialized"]
+                ),
+                "solvation_rebuilt": stage["solvation_rebuilt"],
+                "temperature_ramp_applied": (
+                    stage["temperature_ramp_applied"]
+                ),
+                "cumulative_nominal_time_ps": (
+                    stage["cumulative_nominal_time_ps"]
+                ),
+                "nvt": True,
+                "velocity_output": True,
+                "randomize_velocities": False,
+                "input_restart_path": str(
+                    Path("stages") / stage["restart_from"] / "mdrestart"
+                ),
+            })
     except (KeyError, OSError) as exc:
         raise RuntimeError(
             f"Historical provenance inputs for {stage['name']} are "
@@ -1650,12 +1793,15 @@ def write_md_stage_manifest(
     thermal_result: dict,
     returncode: int = 0,
     recovery: dict | None = None,
+    runtime_metadata: dict | None = None,
 ):
     archive.mkdir(parents=True, exist_ok=True)
     data = dict(configuration)
     data["returncode"] = returncode
     data["output_restart_sha256"] = output_restart_sha256
     data["thermal_result"] = thermal_result
+    if runtime_metadata is not None:
+        data.update(runtime_metadata)
     if recovery is not None:
         data["recovery"] = recovery
     (archive / "stage_manifest.json").write_text(
@@ -1679,9 +1825,14 @@ def validate_completed_md_stage(
     ]
     if expected_configuration["restart"]:
         required.append("mdrestart.input")
-    if (archive / "stage.failed").exists():
+    conflicting_markers = [
+        marker for marker in ("stage.failed", "stage.running")
+        if (archive / marker).exists()
+    ]
+    if conflicting_markers:
         raise RuntimeError(
-            f"Stage {stage_name} has both success and failure markers. "
+            f"Stage {stage_name} has stage.done plus conflicting marker(s) "
+            f"{', '.join(conflicting_markers)}. "
             "Inspect the archive and rerun with --force."
         )
     missing = [name for name in required if not (archive / name).exists()]
@@ -1721,6 +1872,57 @@ def validate_completed_md_stage(
         raise RuntimeError(
             f"Stage {stage_name} records a nonzero xTB return code."
         )
+
+    if stage_name == EXTENDED_STAGE_NAME:
+        required_metadata = [
+            "started_at", "completed_at", "command", "xtb_version",
+            "hostname", "status", "output_paths", "trajectory_integrity",
+            "preflight",
+        ]
+        missing_metadata = [
+            key for key in required_metadata if key not in recorded
+        ]
+        if missing_metadata:
+            raise RuntimeError(
+                f"Completed stage {stage_name} lacks runtime provenance "
+                f"fields: {', '.join(missing_metadata)}."
+            )
+        if recorded.get("status") != "completed":
+            raise RuntimeError(
+                f"Completed stage {stage_name} records status "
+                f"{recorded.get('status')!r}, expected 'completed'."
+            )
+        if not isinstance(recorded.get("command"), list):
+            raise RuntimeError(
+                f"Completed stage {stage_name} has no valid command record."
+            )
+        if not isinstance(recorded.get("xtb_version"), str):
+            raise RuntimeError(
+                f"Completed stage {stage_name} has no xTB version record."
+            )
+        trajectory_integrity = validate_xtb_trajectory(
+            archive / "xtb.trj",
+            expected_atoms=restart_atom_count(archive.parent.parent),
+            expected_frames=md_expected_frame_count(EXTENDED_STAGE),
+            require_velocities=True,
+        )
+        recorded_integrity = recorded["trajectory_integrity"]
+        integrity_fields = [
+            "sha256", "size_bytes", "n_atoms", "frames",
+            "expected_nominal_frames", "constant_atom_count",
+            "constant_element_order", "velocities_present",
+            "finite_coordinates_and_velocities",
+        ]
+        integrity_mismatches = [
+            key for key in integrity_fields
+            if recorded_integrity.get(key) != trajectory_integrity.get(key)
+        ]
+        if integrity_mismatches:
+            raise RuntimeError(
+                f"Completed stage {stage_name} trajectory provenance is "
+                "inconsistent (fields: "
+                f"{', '.join(integrity_mismatches)})."
+            )
 
     archived_restart_hash = validate_output_restart(
         archive / "mdrestart",
@@ -1892,8 +2094,181 @@ def parse_mdrestart(path: Path, expected_atoms: int) -> dict:
         "control_records": control_records,
         "atom_records": atom_records,
         "expected_atoms": expected_atoms,
+        "coordinates_present": True,
+        "velocities_present": True,
         "valid": True,
     }
+
+
+def md_expected_frame_count(stage: dict) -> int:
+    exact_frames = stage["time"] * 1000.0 / MD_DUMP_FS
+    frames = round(exact_frames)
+    if not math.isclose(exact_frames, frames, abs_tol=1.0e-9):
+        raise ValueError(
+            f"Stage {stage['name']} duration/dump interval does not yield "
+            "an integral nominal frame count."
+        )
+    return frames
+
+
+def _finite_values(fields, *, context: str):
+    try:
+        values = [
+            float(value.replace("D", "E").replace("d", "e"))
+            for value in fields
+        ]
+    except ValueError as exc:
+        raise RuntimeError(f"{context}: non-numeric value") from exc
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError(f"{context}: non-finite value")
+    return values
+
+
+def validate_xtb_trajectory(
+    path: Path,
+    *,
+    expected_atoms: int,
+    expected_frames: int,
+    require_velocities: bool,
+) -> dict:
+    """Stream-validate xTB extended XYZ coordinates and velocity blocks."""
+    if not path.is_file():
+        raise RuntimeError(f"missing trajectory: {path}")
+    if path.stat().st_size == 0:
+        raise RuntimeError(f"empty trajectory: {path}")
+
+    frame_count = 0
+    element_order = None
+    with path.open("r", errors="replace") as handle:
+        while True:
+            atom_count_line = handle.readline()
+            if atom_count_line == "":
+                break
+            if not atom_count_line.strip():
+                raise RuntimeError(
+                    f"Invalid trajectory {path}: blank record before frame "
+                    f"{frame_count + 1}."
+                )
+            try:
+                atom_count = int(atom_count_line.strip())
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid trajectory {path}: frame {frame_count + 1} "
+                    "does not start with an atom count."
+                ) from exc
+            if atom_count != expected_atoms:
+                raise RuntimeError(
+                    f"Invalid trajectory {path}: frame {frame_count + 1} has "
+                    f"{atom_count} atoms, expected {expected_atoms}."
+                )
+
+            if handle.readline() == "":
+                raise RuntimeError(
+                    f"Invalid trajectory {path}: missing comment for frame "
+                    f"{frame_count + 1}."
+                )
+
+            frame_elements = []
+            for atom_index in range(1, expected_atoms + 1):
+                line = handle.readline()
+                if line == "":
+                    raise RuntimeError(
+                        f"Invalid trajectory {path}: truncated coordinates "
+                        f"in frame {frame_count + 1}."
+                    )
+                fields = line.split()
+                if len(fields) < 4:
+                    raise RuntimeError(
+                        f"Invalid trajectory {path}: coordinate record "
+                        f"{atom_index} in frame {frame_count + 1} has fewer "
+                        "than four columns."
+                    )
+                _finite_values(
+                    fields[1:4],
+                    context=(
+                        f"Invalid trajectory {path}, frame "
+                        f"{frame_count + 1}, coordinate {atom_index}"
+                    ),
+                )
+                frame_elements.append(fields[0])
+
+            if element_order is None:
+                element_order = tuple(frame_elements)
+            elif tuple(frame_elements) != element_order:
+                raise RuntimeError(
+                    f"Invalid trajectory {path}: element order changes at "
+                    f"frame {frame_count + 1}."
+                )
+
+            if require_velocities:
+                for atom_index in range(1, expected_atoms + 1):
+                    line = handle.readline()
+                    if line == "":
+                        raise RuntimeError(
+                            f"Invalid trajectory {path}: missing velocity "
+                            f"block in frame {frame_count + 1}."
+                        )
+                    fields = line.split()
+                    if len(fields) != 3:
+                        raise RuntimeError(
+                            f"Invalid trajectory {path}: velocity record "
+                            f"{atom_index} in frame {frame_count + 1} must "
+                            "contain exactly three columns."
+                        )
+                    _finite_values(
+                        fields,
+                        context=(
+                            f"Invalid trajectory {path}, frame "
+                            f"{frame_count + 1}, velocity {atom_index}"
+                        ),
+                    )
+            frame_count += 1
+
+    if frame_count == 0:
+        raise RuntimeError(f"Trajectory {path} contains no frames.")
+    if abs(frame_count - expected_frames) > 1:
+        raise RuntimeError(
+            f"Trajectory {path} contains {frame_count} frames; expected "
+            f"approximately {expected_frames} (allowing +/- 1 for the xTB "
+            "initial/final-frame convention)."
+        )
+
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "size_bytes": path.stat().st_size,
+        "n_atoms": expected_atoms,
+        "frames": frame_count,
+        "expected_nominal_frames": expected_frames,
+        "frame_tolerance": 1,
+        "constant_atom_count": True,
+        "constant_element_order": True,
+        "velocities_present": require_velocities,
+        "finite_coordinates_and_velocities": True,
+    }
+
+
+def extract_xtb_version(log_path: Path, trajectory_path: Path) -> str | None:
+    for path, patterns in (
+        (
+            log_path,
+            [r"\bxtb\s+version\s+([^\n]+)"],
+        ),
+        (
+            trajectory_path,
+            [r"\bxtb\s*:\s*([^\n]+)"],
+        ),
+    ):
+        try:
+            with path.open("r", errors="replace") as handle:
+                text = handle.read(128 * 1024)
+        except OSError:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    return None
 
 
 def validate_output_restart(
@@ -2475,6 +2850,8 @@ def validate_historical_md_prefix(
     replica_dir: Path,
     stop_index: int,
     args,
+    *,
+    allow_recovery: bool = True,
 ) -> dict | None:
     """Validate/reuse historical MD stages preceding an explicit start."""
     previous_output_sha256 = None
@@ -2497,7 +2874,7 @@ def validate_historical_md_prefix(
             archive,
             configuration,
             args,
-            recovery_requested=True,
+            recovery_requested=allow_recovery,
         )
         recorded = validate_completed_md_stage(
             archive,
@@ -2579,6 +2956,175 @@ def validate_start_predecessor_compatibility(
     return override
 
 
+def validate_extended_stage_preconditions(
+    replica_dir: Path,
+    previous_configuration: dict,
+    args,
+) -> dict:
+    """Validate the exact 04 -> 05 continuation before any stage mutation."""
+    previous_name = EXTENDED_STAGE["restart_from"]
+    previous_archive = stage_archive_dir(replica_dir, previous_name)
+    done = previous_archive / "stage.done"
+    failed = previous_archive / "stage.failed"
+    if not done.is_file():
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: missing validated "
+            f"{previous_name}/stage.done at {done}."
+        )
+    if failed.exists():
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: unresolved "
+            f"{previous_name}/stage.failed exists at {failed}."
+        )
+
+    try:
+        manifest = json.loads((replica_dir / "manifest.json").read_text())
+        n_atoms = manifest["geometry_after_centering"]["n_atoms"]
+        relaxation = manifest["relaxation"]
+        n_solute = relaxation["n_solute_atoms"]
+        n_waters = manifest["packing"]["water_count"]
+        wall_radius_bohr = manifest["wall"]["radius_bohr"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: replica composition/wall "
+            "metadata is missing or invalid."
+        ) from exc
+
+    for label, value in (
+        ("total atom count", n_atoms),
+        ("solute atom count", n_solute),
+        ("water count", n_waters),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise RuntimeError(
+                f"Cannot start {EXTENDED_STAGE_NAME}: invalid {label} "
+                f"{value!r} in manifest.json."
+            )
+    if n_solute + 3 * n_waters != n_atoms:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: manifest composition is "
+            f"inconsistent ({n_solute} solute atoms + {n_waters} waters x 3 "
+            f"!= {n_atoms} total atoms)."
+        )
+
+    expected_previous = {
+        "stage": previous_name,
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "threads": args.threads,
+        "temp_K": EXTENDED_STAGE["temp"],
+        "time_ps": STAGES[CORE_STAGE_COUNT - 1]["time"],
+        "step_fs": MD_STEP_FS,
+        "dump_fs": MD_DUMP_FS,
+        "hmass": 1,
+        "shake": 0,
+        "sccacc": 1.0,
+        "restart": True,
+        "wall_radius_bohr": wall_radius_bohr,
+    }
+    mismatched = configuration_mismatches(
+        expected_previous,
+        previous_configuration,
+    )
+    if mismatched:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: {previous_name} does not "
+            "match the inherited continuation protocol (fields: "
+            f"{', '.join(mismatched)})."
+        )
+
+    restart_path = previous_archive / "mdrestart"
+    restart_metadata = parse_mdrestart(restart_path, n_atoms)
+    restart_sha256 = file_sha256(restart_path)
+    stage_manifest_path = previous_archive / "stage_manifest.json"
+    try:
+        previous_stage_manifest = json.loads(stage_manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: missing or invalid "
+            f"{stage_manifest_path}."
+        ) from exc
+    if previous_stage_manifest.get("output_restart_sha256") != restart_sha256:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: {previous_name} restart "
+            "SHA-256 does not match its stage manifest."
+        )
+
+    previous_trajectory = previous_archive / "xtb.trj"
+    if not previous_trajectory.is_file() or previous_trajectory.stat().st_size == 0:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: missing or empty "
+            f"{previous_name} trajectory at {previous_trajectory}."
+        )
+    duration_ratio = (
+        EXTENDED_STAGE["time"] / STAGES[CORE_STAGE_COUNT - 1]["time"]
+    )
+    estimated_trajectory_bytes = math.ceil(
+        previous_trajectory.stat().st_size * duration_ratio
+    )
+    required_free_bytes = math.ceil(
+        estimated_trajectory_bytes * 1.25
+        + restart_path.stat().st_size * 3
+    )
+    free_bytes = shutil.disk_usage(replica_dir).free
+    if free_bytes < required_free_bytes:
+        raise RuntimeError(
+            f"Cannot start {EXTENDED_STAGE_NAME}: only {free_bytes} bytes "
+            f"free, below the conservative estimate of {required_free_bytes} "
+            "bytes required for trajectory, restart copies, and margin."
+        )
+
+    return {
+        "previous_stage": previous_name,
+        "restart_path": restart_path,
+        "restart_sha256": restart_sha256,
+        "restart_size_bytes": restart_path.stat().st_size,
+        "restart_validation": restart_metadata,
+        "n_atoms": n_atoms,
+        "n_solute_atoms": n_solute,
+        "n_waters": n_waters,
+        "wall_radius_bohr": wall_radius_bohr,
+        "estimated_trajectory_bytes": estimated_trajectory_bytes,
+        "required_free_bytes": required_free_bytes,
+        "free_bytes": free_bytes,
+    }
+
+
+def print_extended_dry_run(replica_dir: Path, args, preflight: dict):
+    stage = EXTENDED_STAGE
+    input_name = f"{EXTENDED_STAGE_NAME}.inp"
+    geometry_name = "system_centered.pdb"
+    cmd = xtb_command(args, geometry_name, input_name)
+    print(f"\nDRY-RUN {replica_dir.parent.name}/{replica_dir.name}")
+    print(f"  System: {replica_dir.parent.name}")
+    print(f"  Replica: {replica_dir.name}")
+    print(f"  Stage: {EXTENDED_STAGE_NAME}")
+    print(f"  Restart: {preflight['restart_path']}")
+    print(f"  Restart SHA256: {preflight['restart_sha256']}")
+    print(f"  Atoms: {preflight['n_atoms']}")
+    print(f"  Solute atoms: {preflight['n_solute_atoms']}")
+    print(f"  Waters: {preflight['n_waters']}")
+    print(f"  Temperature: {stage['temp']:.2f} K")
+    print(f"  Duration: {stage['time']:.1f} ps")
+    print(f"  Time step: {MD_STEP_FS:.1f} fs")
+    print(f"  Steps: {md_step_count(stage)}")
+    print(f"  Dump interval: {MD_DUMP_FS:.1f} fs")
+    print("  Randomize velocities: no")
+    print("  Solvation rebuilt: no")
+    print(f"  Command: {' '.join(cmd)}")
+    print(f"  Planned input {input_name}:")
+    print(md_input(stage, preflight["wall_radius_bohr"]).rstrip())
+
+
+def md_stop_index_for_request(args) -> int:
+    """Keep stage 05 opt-in while all existing execution modes stop at 04."""
+    if args.start_stage == EXTENDED_STAGE_NAME:
+        return EXTENDED_STAGE_INDEX
+    return CORE_STAGE_COUNT - 1
+
+
 def run_replica(replica_dir: Path, args):
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.threads)
@@ -2600,7 +3146,9 @@ def run_replica(replica_dir: Path, args):
         relaxation_enabled = not args.skip_relax
 
     md_start_index = 0
+    md_stop_index = md_stop_index_for_request(args)
     start_stage_override = None
+    extended_preflight = None
 
     if args.resume:
         if relaxation_enabled:
@@ -2625,6 +3173,7 @@ def run_replica(replica_dir: Path, args):
                 replica_dir,
                 md_start_index,
                 args,
+                allow_recovery=not args.dry_run,
             )
             if previous_configuration is not None:
                 previous_stage = STAGES[md_start_index - 1]
@@ -2636,11 +3185,25 @@ def run_replica(replica_dir: Path, args):
                         args,
                     )
                 )
+            if args.start_stage == EXTENDED_STAGE_NAME:
+                extended_preflight = validate_extended_stage_preconditions(
+                    replica_dir,
+                    previous_configuration,
+                    args,
+                )
+                if args.dry_run:
+                    print_extended_dry_run(
+                        replica_dir,
+                        args,
+                        extended_preflight,
+                    )
+                    return
+                ensure_extended_stage_registered(replica_dir)
     elif relaxation_enabled:
         run_relaxation(replica_dir, args, env)
 
     for i, stage in enumerate(STAGES):
-        if i < md_start_index:
+        if i < md_start_index or i > md_stop_index:
             continue
 
         name = stage["name"]
@@ -2677,7 +3240,10 @@ def run_replica(replica_dir: Path, args):
             args=args,
         )
         archive = stage_archive_dir(replica_dir, name)
-        recovery_requested = args.resume or args.start_stage is not None
+        recovery_requested = (
+            (args.resume or args.start_stage is not None)
+            and not args.force
+        )
         if recovery_requested and (archive / "stage.failed").exists():
             historical_stage, historical_configuration = (
                 historical_md_stage_configuration(
@@ -2763,9 +3329,26 @@ def run_replica(replica_dir: Path, args):
                 print(
                     f"       input restart SHA256: {copied_input_hash}"
                 )
+            elif name == EXTENDED_STAGE_NAME:
+                print(
+                    f"  START {EXTENDED_STAGE_NAME} from final restart of "
+                    f"{EXTENDED_STAGE['restart_from']}"
+                )
+                print(
+                    f"       input restart SHA256: {copied_input_hash}"
+                )
 
         log_path = replica_dir / f"{name}.out"
         cmd = xtb_command(args, geometry_name, input_name)
+        started_at = datetime.now(timezone.utc).isoformat()
+        running_metadata = {
+            "stage": name,
+            "status": "running",
+            "started_at": started_at,
+            "command": cmd,
+            "hostname": socket.gethostname(),
+        }
+        mark_stage_running(archive, running_metadata)
 
         print(
             f"  RUN  {replica_dir.parent.name}/"
@@ -2774,6 +3357,15 @@ def run_replica(replica_dir: Path, args):
         print(f"       {' '.join(cmd)}")
 
         with log_path.open("w") as log:
+            if name == EXTENDED_STAGE_NAME:
+                continuation_message = (
+                    "Continuing 04_298K_screen from its final restart: "
+                    f"{stage['time']:.1f} ps at {stage['temp']:.2f} K, "
+                    f"{md_step_count(stage)} steps, dt = {MD_STEP_FS:.1f} fs."
+                )
+                print(f"       {continuation_message}")
+                log.write(continuation_message + "\n")
+                log.flush()
             result = subprocess.run(
                 cmd,
                 cwd=replica_dir,
@@ -2819,6 +3411,27 @@ def run_replica(replica_dir: Path, args):
                 f"{replica_dir.parent.name}/{replica_dir.name}. "
                 f"Outputs were archived for inspection. See {log_path}"
             )
+
+        trajectory_integrity = None
+        if name == EXTENDED_STAGE_NAME:
+            try:
+                trajectory_integrity = validate_xtb_trajectory(
+                    replica_dir / "xtb.trj",
+                    expected_atoms=restart_atom_count(replica_dir),
+                    expected_frames=md_expected_frame_count(stage),
+                    require_velocities=True,
+                )
+            except RuntimeError as exc:
+                archive_failed_md_stage(
+                    replica_dir,
+                    name,
+                    log_path,
+                    str(exc),
+                )
+                raise RuntimeError(
+                    f"{name} produced an invalid trajectory ({exc}). "
+                    "Outputs were archived for inspection."
+                ) from exc
 
         restart_path = replica_dir / "mdrestart"
         try:
@@ -2866,6 +3479,69 @@ def run_replica(replica_dir: Path, args):
             args.thermostat_warning_policy,
             warning_accepted,
         )
+        runtime_metadata = None
+        if name == EXTENDED_STAGE_NAME:
+            if file_sha256(extended_preflight["restart_path"]) != (
+                extended_preflight["restart_sha256"]
+            ):
+                archive_failed_md_stage(
+                    replica_dir,
+                    name,
+                    log_path,
+                    f"archived {EXTENDED_STAGE['restart_from']} restart "
+                    "changed during continuation",
+                )
+                raise RuntimeError(
+                    f"Archived {EXTENDED_STAGE['restart_from']} restart "
+                    "changed during the continuation; refusing to certify "
+                    f"{name}."
+                )
+            xtb_version = extract_xtb_version(
+                log_path,
+                replica_dir / "xtb.trj",
+            )
+            if xtb_version is None:
+                archive_failed_md_stage(
+                    replica_dir,
+                    name,
+                    log_path,
+                    "xTB version could not be determined from log/trajectory",
+                )
+                raise RuntimeError(
+                    f"{name} outputs do not report the xTB version; refusing "
+                    "to mark the continuation as provenance-complete."
+                )
+            archived_trajectory_path = str(
+                Path("stages") / name / "xtb.trj"
+            )
+            trajectory_integrity = dict(trajectory_integrity)
+            trajectory_integrity["path"] = archived_trajectory_path
+            preflight_record = {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in extended_preflight.items()
+            }
+            runtime_metadata = {
+                "started_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "command": cmd,
+                "xtb_version": xtb_version,
+                "hostname": socket.gethostname(),
+                "status": "completed",
+                "preflight": preflight_record,
+                "trajectory_integrity": trajectory_integrity,
+                "output_trajectory_sha256": trajectory_integrity["sha256"],
+                "output_paths": {
+                    "input": str(Path("stages") / name / input_name),
+                    "log": str(Path("stages") / name / log_path.name),
+                    "trajectory": archived_trajectory_path,
+                    "input_restart_copy": str(
+                        Path("stages") / name / "mdrestart.input"
+                    ),
+                    "output_restart": str(
+                        Path("stages") / name / "mdrestart"
+                    ),
+                },
+            }
         if (
             validation["thermostating_problem"]
             and not warning_accepted
@@ -2880,6 +3556,7 @@ def run_replica(replica_dir: Path, args):
                 stage_configuration,
                 output_restart_sha256,
                 thermal_result,
+                runtime_metadata=runtime_metadata,
             )
             archive_stage_outputs(
                 replica_dir,
@@ -2889,7 +3566,7 @@ def run_replica(replica_dir: Path, args):
             mark_stage_failed(archive, reason)
             next_stage = (
                 STAGES[i + 1]["name"]
-                if i + 1 < len(STAGES)
+                if i + 1 <= md_stop_index
                 else "pipeline completion"
             )
             if not validation["normal_exit_of_md"]:
@@ -2910,6 +3587,7 @@ def run_replica(replica_dir: Path, args):
             stage_configuration,
             output_restart_sha256,
             thermal_result,
+            runtime_metadata=runtime_metadata,
         )
         archive_stage_outputs(
             replica_dir,
@@ -2921,7 +3599,7 @@ def run_replica(replica_dir: Path, args):
         if warning_accepted:
             next_stage = (
                 STAGES[i + 1]["name"]
-                if i + 1 < len(STAGES)
+                if i + 1 <= md_stop_index
                 else "pipeline completion"
             )
             print(
@@ -2935,15 +3613,20 @@ def run_replica(replica_dir: Path, args):
     final_archived = (
         stage_archive_dir(
             replica_dir,
-            STAGES[-1]["name"],
+            STAGES[md_stop_index]["name"],
         )
         / "mdrestart"
     )
 
     if final_archived.exists():
+        final_name = (
+            "mdrestart_final"
+            if md_stop_index < EXTENDED_STAGE_INDEX
+            else f"mdrestart_final_{EXTENDED_STAGE_NAME}"
+        )
         shutil.copy2(
             final_archived,
-            replica_dir / "mdrestart_final",
+            replica_dir / final_name,
         )
 
 
@@ -2955,7 +3638,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=(
             "Prepare spherical Packmol droplets and optionally run "
-            "xTB MD E2 thermalization + screening."
+            "xTB MD E2 thermalization + screening, with an opt-in "
+            "20 ps continuation."
         )
     )
 
@@ -3068,6 +3752,16 @@ def parse_args():
         help=(
             "Run xTB after preparation. Without --run, only Packmol "
             "packing + centering + input generation are performed."
+        ),
+    )
+
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Validate and display the opt-in 05_298K_extended plan without "
+            "writing files or calling xTB; requires "
+            "--start-stage 05_298K_extended."
         ),
     )
 
@@ -3186,7 +3880,9 @@ def parse_args():
         choices=EXECUTION_STAGES,
         help=(
             "Start execution from an existing prepared stage. In particular, "
-            "04_298K_screen may explicitly reuse a valid historical 03 restart."
+            "04_298K_screen may explicitly reuse a valid historical 03 "
+            "restart, while 05_298K_extended is the opt-in 20 ps continuation "
+            "from a validated 04 restart."
         ),
     )
 
@@ -3251,16 +3947,41 @@ def validate_args(args):
     if args.relax_cycles < 1:
         raise SystemExit("--relax-cycles must be >= 1.")
 
+    if args.run and args.dry_run:
+        raise SystemExit("--run cannot be combined with --dry-run.")
+
+    if args.dry_run and args.start_stage != EXTENDED_STAGE_NAME:
+        raise SystemExit(
+            f"--dry-run requires --start-stage {EXTENDED_STAGE_NAME}."
+        )
+
     if args.resume and args.start_stage is not None:
         raise SystemExit("--resume cannot be combined with --start-stage.")
 
-    if (args.resume or args.start_stage is not None) and not args.run:
-        raise SystemExit("--resume/--start-stage require --run.")
+    if args.resume and args.dry_run:
+        raise SystemExit("--resume cannot be combined with --dry-run.")
 
-    if (args.resume or args.start_stage is not None) and args.force:
+    if (
+        (args.resume or args.start_stage is not None)
+        and not (args.run or args.dry_run)
+    ):
+        raise SystemExit("--resume/--start-stage require --run or --dry-run.")
+
+    if args.resume and args.force:
+        raise SystemExit("--resume cannot be combined with --force.")
+
+    if (
+        args.start_stage is not None
+        and args.force
+        and args.start_stage != EXTENDED_STAGE_NAME
+    ):
         raise SystemExit(
-            "--resume/--start-stage cannot be combined with --force."
+            "--start-stage can be combined with --force only for the isolated "
+            f"{EXTENDED_STAGE_NAME} continuation."
         )
+
+    if args.dry_run and args.force:
+        raise SystemExit("--dry-run cannot be combined with --force.")
 
     if (args.resume or args.start_stage is not None) and args.repack:
         raise SystemExit(
@@ -3340,7 +4061,7 @@ def main():
                 )
                 replica_dirs.append(replica_dir)
 
-    if args.run:
+    if args.run or args.dry_run:
         print("\nStarting xTB relaxation + MD E2 pipeline...")
 
         for replica_dir in replica_dirs:
@@ -3349,7 +4070,13 @@ def main():
                 args,
             )
 
-        print("\nAll requested replicas completed.")
+        if args.dry_run:
+            print(
+                "\nDry-run validation completed; no files were written and "
+                "xTB was not called."
+            )
+        else:
+            print("\nAll requested replicas completed.")
 
     else:
         print(

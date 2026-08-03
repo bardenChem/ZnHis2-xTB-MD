@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """xtb_analysis.py
 
-Post-processing and plotting toolkit for xTB molecular-dynamics trajectories.
+Post-processing, plotting, and coordinate-export toolkit for xTB
+molecular-dynamics trajectories.
 
-Focus of v0.2:
+Focus of v0.3:
 - xTB extended-XYZ trajectories (xtb.trj), with coordinates only or with an
   additional per-frame velocity block
 - stage archives from xtb_md_pipeline.py
@@ -21,12 +22,13 @@ Implemented analyses:
 8. Kabsch-aligned solute RMSD and RMSF.
 9. Standard XYZ export for TRAVIS.
 10. Optional headless diagnostic plots from the calculated analysis tables.
+11. Validated coordinate-only exports for TRAVIS and VMD workflows.
 
 No bulk-normalized RDF is computed for finite droplets because a spherical,
 inhomogeneous droplet with a wall is not equivalent to periodic bulk liquid.
 
 Velocity records are preserved in ``Frame.velocities`` but are not analyzed in
-v0.2, no physical unit is assigned to them, and the TRAVIS XYZ export continues
+v0.3, no physical unit is assigned to them, and the TRAVIS/VMD exports continue
 to contain coordinates only.
 """
 
@@ -40,6 +42,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 from typing import Iterator
 
 import numpy as np
@@ -80,6 +83,13 @@ class TrajectorySpec:
     path: Path
     stage: str
     dt_fs: float | None
+
+
+@dataclass(frozen=True)
+class KabschTransform:
+    rotation_matrix: np.ndarray
+    translation_before_rotation: np.ndarray
+    translation_after_rotation: np.ndarray
 
 
 def sha256(path: Path) -> str:
@@ -268,6 +278,38 @@ def parse_site(text: str) -> Site:
     return Site(fields[0], index1 - 1, fields[2] if len(fields) == 3 else "site")
 
 
+def parse_alignment_indices(text: str) -> list[int]:
+    """Parse one-based comma/range syntax and return zero-based indices."""
+    indices = []
+    seen = set()
+    for raw_field in text.split(","):
+        field = raw_field.strip()
+        if not field:
+            raise argparse.ArgumentTypeError(
+                "--alignment-indices contains an empty field"
+            )
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", field)
+        if not match:
+            raise argparse.ArgumentTypeError(
+                "--alignment-indices must use syntax such as 1-5,10,12-19"
+            )
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end < start:
+            raise argparse.ArgumentTypeError(
+                "alignment indices are one-based and ranges must be ascending"
+            )
+        for index1 in range(start, end + 1):
+            index0 = index1 - 1
+            if index0 in seen:
+                raise argparse.ArgumentTypeError(
+                    f"duplicate alignment index: {index1}"
+                )
+            seen.add(index0)
+            indices.append(index0)
+    return indices
+
+
 def manifest(replica: Path) -> dict:
     try:
         return json.loads((replica / "manifest.json").read_text())
@@ -346,7 +388,12 @@ def water_oxygens(topology, elements, nsolute, water_resnames):
     return [], warnings
 
 
-def kabsch(mobile, reference):
+def kabsch_transform(mobile, reference) -> KabschTransform:
+    """Return the rigid transform that aligns mobile row vectors to reference."""
+    mobile = np.asarray(mobile, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    if mobile.shape != reference.shape or mobile.ndim != 2 or mobile.shape[1] != 3:
+        raise ValueError("Kabsch inputs must have matching shape (n, 3)")
     mc = mobile.mean(0)
     rc = reference.mean(0)
     mob = mobile - mc
@@ -356,7 +403,80 @@ def kabsch(mobile, reference):
     if np.linalg.det(rot) < 0:
         vt[-1] *= -1
         rot = u @ vt
-    return mob @ rot + rc
+    return KabschTransform(
+        rotation_matrix=rot,
+        translation_before_rotation=-mc,
+        translation_after_rotation=rc,
+    )
+
+
+def apply_kabsch_transform(xyz, transform: KabschTransform):
+    xyz = np.asarray(xyz, dtype=float)
+    return (
+        (xyz + transform.translation_before_rotation)
+        @ transform.rotation_matrix
+        + transform.translation_after_rotation
+    )
+
+
+def kabsch(mobile, reference):
+    """Align coordinates while preserving the original public helper."""
+    transform = kabsch_transform(mobile, reference)
+    return apply_kabsch_transform(mobile, transform)
+
+
+def validate_alignment_geometry(xyz, indices):
+    if len(indices) < 3:
+        raise RuntimeError("Alignment requires at least three atoms")
+    selected = np.asarray(xyz, dtype=float)[indices]
+    centered = selected - selected.mean(axis=0)
+    if np.linalg.matrix_rank(centered) < 2:
+        raise RuntimeError(
+            "Alignment selection must contain at least three non-collinear atoms"
+        )
+
+
+def resolve_alignment_selection(
+    elements,
+    xyz,
+    nsolute,
+    selection,
+    explicit_indices,
+):
+    """Return alignment indices and reproducible selection metadata."""
+    nat = len(elements)
+    if explicit_indices is not None:
+        indices = list(explicit_indices)
+        mode = "explicit-indices"
+    elif nsolute is None:
+        return None, {
+            "mode": selection,
+            "indices_one_based": [],
+            "available": False,
+            "reason": "n_solute is unavailable and no explicit indices were supplied",
+        }
+    elif selection == "solute-heavy":
+        indices = [i for i in range(nsolute) if elements[i].upper() != "H"]
+        mode = selection
+    elif selection == "solute-all":
+        indices = list(range(nsolute))
+        mode = selection
+    else:
+        raise RuntimeError(f"Unsupported alignment selection: {selection}")
+
+    if len(indices) != len(set(indices)):
+        raise RuntimeError("Alignment selection contains duplicate atom indices")
+    if any(index < 0 or index >= nat for index in indices):
+        bad = [index + 1 for index in indices if index < 0 or index >= nat]
+        raise RuntimeError(f"Alignment indices out of range for {nat} atoms: {bad}")
+    validate_alignment_geometry(xyz, indices)
+    return indices, {
+        "mode": mode,
+        "indices_one_based": [index + 1 for index in indices],
+        "elements": [elements[index] for index in indices],
+        "available": True,
+        "reason": None,
+    }
 
 
 def tetra_q(vectors):
@@ -394,6 +514,429 @@ def write_xyz_frame(handle, elements, xyz, comment):
     handle.write(f"{len(elements)}\n{comment}\n")
     for e, r in zip(elements, xyz):
         handle.write(f"{e:<3s} {r[0]: .12f} {r[1]: .12f} {r[2]: .12f}\n")
+
+
+def export_comment(
+    system,
+    stage,
+    source_frame,
+    global_frame,
+    time_ps,
+    alignment,
+):
+    """Build a deterministic one-line XYZ comment."""
+    clean = lambda value: re.sub(r"\s+", "_", str(value))
+    fields = [
+        f"system={clean(system)}",
+        f"stage={clean(stage)}",
+        f"source_frame={source_frame}",
+        f"global_frame={global_frame}",
+    ]
+    if time_ps is not None and math.isfinite(time_ps):
+        fields.append(f"time_ps={time_ps:.6f}")
+    fields.append(f"alignment={clean(alignment)}")
+    return " ".join(fields)
+
+
+class CoordinateExporter:
+    """Stream coordinate-only XYZ variants from already-retained frames."""
+
+    def __init__(
+        self,
+        output_dir,
+        nsolute,
+        alignment_indices,
+        alignment_mode,
+        system,
+    ):
+        self.output_dir = output_dir
+        self.nsolute = nsolute
+        self.alignment_indices = alignment_indices
+        self.alignment_mode = alignment_mode
+        self.system = system
+        self.reference_xyz = None
+        self.reference_frame = None
+        self.exported_frames = 0
+        self.first_exported_time_ps = None
+        self.last_exported_time_ps = None
+        self.paths = {
+            "full_coordinates": output_dir / "trajectory_full_coordinates.xyz",
+        }
+        if nsolute is not None:
+            self.paths["solute_coordinates"] = (
+                output_dir / "trajectory_solute_coordinates.xyz"
+            )
+        if alignment_indices is not None:
+            self.paths["full_aligned_on_solute"] = (
+                output_dir / "trajectory_full_aligned_on_solute.xyz"
+            )
+            if nsolute is not None:
+                self.paths["solute_aligned"] = (
+                    output_dir / "trajectory_solute_aligned.xyz"
+                )
+
+        managed_variants = {
+            "trajectory_full_coordinates.xyz",
+            "trajectory_full_aligned_on_solute.xyz",
+            "trajectory_solute_coordinates.xyz",
+            "trajectory_solute_aligned.xyz",
+        }
+        expected_names = {path.name for path in self.paths.values()}
+        stale = sorted(
+            str(output_dir / name)
+            for name in managed_variants - expected_names
+            if (output_dir / name).exists()
+        )
+        vmd_dir = output_dir.parent / "vmd"
+        if alignment_indices is None and vmd_dir.exists():
+            stale.extend(str(path) for path in sorted(vmd_dir.iterdir()))
+        if stale:
+            raise RuntimeError(
+                "Existing export files are incompatible with the current "
+                f"selection; use a clean --output-dir or remove them explicitly: {stale}"
+            )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.handles = {}
+        try:
+            for name, path in self.paths.items():
+                self.handles[name] = path.open("w")
+        except Exception:
+            self.close()
+            raise
+
+    def set_reference(self, xyz, context):
+        if self.alignment_indices is None or self.reference_xyz is not None:
+            return
+        self.reference_xyz = np.asarray(xyz, dtype=float).copy()
+        self.reference_frame = dict(context)
+
+    def write(
+        self,
+        elements,
+        xyz,
+        stage,
+        source_frame,
+        global_frame,
+        time_ps,
+    ):
+        unaligned_comment = export_comment(
+            self.system,
+            stage,
+            source_frame,
+            global_frame,
+            time_ps,
+            "none",
+        )
+        write_xyz_frame(
+            self.handles["full_coordinates"],
+            elements,
+            xyz,
+            unaligned_comment,
+        )
+        if "solute_coordinates" in self.handles:
+            write_xyz_frame(
+                self.handles["solute_coordinates"],
+                elements[:self.nsolute],
+                xyz[:self.nsolute],
+                unaligned_comment,
+            )
+
+        if self.alignment_indices is not None:
+            if self.reference_xyz is None:
+                raise RuntimeError("Alignment reference frame was not initialized")
+            transform = kabsch_transform(
+                xyz[self.alignment_indices],
+                self.reference_xyz[self.alignment_indices],
+            )
+            aligned = apply_kabsch_transform(xyz, transform)
+            aligned_comment = export_comment(
+                self.system,
+                stage,
+                source_frame,
+                global_frame,
+                time_ps,
+                self.alignment_mode,
+            )
+            write_xyz_frame(
+                self.handles["full_aligned_on_solute"],
+                elements,
+                aligned,
+                aligned_comment,
+            )
+            if "solute_aligned" in self.handles:
+                write_xyz_frame(
+                    self.handles["solute_aligned"],
+                    elements[:self.nsolute],
+                    aligned[:self.nsolute],
+                    aligned_comment,
+                )
+
+        self.exported_frames += 1
+        if time_ps is not None and math.isfinite(time_ps):
+            if self.first_exported_time_ps is None:
+                self.first_exported_time_ps = time_ps
+            self.last_exported_time_ps = time_ps
+
+    def close(self):
+        for handle in getattr(self, "handles", {}).values():
+            if not handle.closed:
+                handle.close()
+
+
+def validate_coordinate_xyz(path, expected_frames, expected_atoms):
+    """Validate a coordinate-only, constant-order XYZ trajectory."""
+    frame_count = 0
+    reference_elements = None
+    pending_line = None
+    with path.open("r", errors="replace") as handle:
+        while True:
+            atom_count_line = pending_line
+            pending_line = None
+            if atom_count_line is None:
+                atom_count_line = read_next_nonblank_line(handle)
+            if atom_count_line is None:
+                break
+            try:
+                nat = int(atom_count_line.strip())
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{path}: expected atom count while validating frame "
+                    f"{frame_count}, found {atom_count_line.rstrip()!r}"
+                ) from exc
+            if nat != expected_atoms:
+                raise RuntimeError(
+                    f"{path}: frame {frame_count} has {nat} atoms; "
+                    f"expected {expected_atoms}"
+                )
+            comment = handle.readline()
+            if not comment:
+                raise RuntimeError(
+                    f"{path}: missing comment at exported frame {frame_count}"
+                )
+            elements = []
+            for iatom in range(nat):
+                coordinate_line = handle.readline()
+                fields = coordinate_line.split()
+                if len(fields) != 4:
+                    raise RuntimeError(
+                        f"{path}: exported coordinate record must contain exactly "
+                        f"element x y z at frame {frame_count}, atom "
+                        f"{iatom+1}/{nat}: {coordinate_line.rstrip()!r}"
+                    )
+                try:
+                    [parse_float_token(token) for token in fields[1:4]]
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{path}: non-finite or malformed coordinate at frame "
+                        f"{frame_count}, atom {iatom+1}/{nat}: "
+                        f"{coordinate_line.rstrip()!r}"
+                    ) from exc
+                elements.append(element_name(fields[0]))
+            if reference_elements is None:
+                reference_elements = elements
+            elif elements != reference_elements:
+                raise RuntimeError(
+                    f"{path}: element order changed at frame {frame_count}"
+                )
+            frame_count += 1
+
+            next_line = read_next_nonblank_line(handle)
+            if next_line is not None:
+                if parse_numeric_triplet(next_line) is not None or len(
+                    next_line.split()
+                ) == 3:
+                    raise RuntimeError(
+                        f"{path}: exported XYZ unexpectedly contains velocity records"
+                    )
+                pending_line = next_line
+
+    if frame_count != expected_frames:
+        raise RuntimeError(
+            f"{path}: found {frame_count} frames; expected {expected_frames}"
+        )
+    return {
+        "frames": frame_count,
+        "atoms_per_frame": expected_atoms,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256(path),
+        "coordinates_only": True,
+    }
+
+
+def write_minimal_pdb(path, elements, xyz):
+    """Write order/element-preserving PDB records without inferred bonds."""
+    with path.open("w") as handle:
+        for i, (element, coord) in enumerate(zip(elements, xyz), 1):
+            if not np.all(np.isfinite(coord)):
+                raise RuntimeError(f"Cannot write non-finite PDB coordinate at atom {i}")
+            atom_name = element.upper()[:2]
+            handle.write(
+                f"HETATM{i:5d} {atom_name:^4s} SYS A{1:4d}    "
+                f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}"
+                f"  1.00  0.00          {element:>2s}\n"
+            )
+        handle.write("END\n")
+
+
+def prepare_reference_topology(output_path, topology_path, first_frame):
+    if topology_path is not None:
+        source = topology_path.resolve()
+        if source != output_path.resolve():
+            shutil.copy2(source, output_path)
+        provenance = {
+            "status": "copied",
+            "source_path": str(source),
+            "source_sha256": sha256(source),
+        }
+    else:
+        write_minimal_pdb(output_path, first_frame.elements, first_frame.xyz)
+        provenance = {
+            "status": "generated",
+            "source_path": None,
+            "source_sha256": None,
+            "note": "Minimal PDB generated without inferred connectivity.",
+        }
+    exported_atoms = parse_pdb(output_path)
+    if len(exported_atoms) != len(first_frame.elements):
+        raise RuntimeError(
+            f"{output_path}: topology has {len(exported_atoms)} atoms; "
+            f"expected {len(first_frame.elements)}"
+        )
+    if [atom.element for atom in exported_atoms] != first_frame.elements:
+        raise RuntimeError(
+            f"{output_path}: topology element/order differs from trajectory"
+        )
+    provenance.update({
+        "output_path": str(output_path),
+        "output_sha256": sha256(output_path),
+    })
+    return provenance
+
+
+def write_atom_map(path, elements, topology, nsolute, water_O, zn, sites):
+    site_map = {}
+    for site in sites:
+        entry = site_map.setdefault(site.index0, {"labels": [], "groups": []})
+        entry["labels"].append(site.label)
+        entry["groups"].append(site.group)
+    water_set = set(water_O)
+    rows = []
+    for i, element in enumerate(elements):
+        atom = topology[i] if topology else None
+        site = site_map.get(i, {"labels": [], "groups": []})
+        rows.append({
+            "index": i + 1,
+            "element": element,
+            "atom_name": atom.name if atom else "",
+            "resname": atom.resname if atom else "",
+            "resid": atom.resid if atom else "",
+            "is_solute": bool(nsolute is not None and i < nsolute),
+            "is_water_O": i in water_set,
+            "is_Zn": i == zn,
+            "site_label": ";".join(site["labels"]),
+            "site_group": ";".join(site["groups"]),
+        })
+    fields = [
+        "index", "element", "atom_name", "resname", "resid", "is_solute",
+        "is_water_O", "is_Zn", "site_label", "site_group",
+    ]
+    write_csv(path, rows, fields)
+
+
+def write_travis_readme(path, system, available_files):
+    system_dir = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(system)) or "system"
+    available = set(available_files)
+    lines = [
+        "# TRAVIS coordinate exports",
+        "",
+        "All XYZ files contain coordinates only. Velocities from `xtb.trj` were",
+        "intentionally omitted. Run each TRAVIS analysis in a separate directory:",
+        "",
+        "```text",
+        f"travis_runs/{system_dir}/",
+        "├── tdo/",
+        "├── adf/",
+        "├── sdf/",
+        "├── cdf/",
+        "└── radial/",
+        "```",
+        "",
+        "Do not combine different analyses in the same output directory, and do",
+        "not automate menu numbers because they can change between TRAVIS versions.",
+        "",
+    ]
+    if "solute_aligned" in available:
+        lines += [
+            "For TDO and solute-geometry inspection:",
+            "",
+            "```bash",
+            f"mkdir -p travis_runs/{system_dir}/tdo",
+            f"cd travis_runs/{system_dir}/tdo",
+            f"travis -p ../../../analysis/{system_dir}/travis/trajectory_solute_aligned.xyz",
+            "```",
+            "",
+        ]
+    if "full_aligned_on_solute" in available:
+        lines += [
+            "For water-relative SDF exploration and aligned videos:",
+            "",
+            "```bash",
+            f"mkdir -p travis_runs/{system_dir}/sdf",
+            f"cd travis_runs/{system_dir}/sdf",
+            f"travis -p ../../../analysis/{system_dir}/travis/trajectory_full_aligned_on_solute.xyz",
+            "```",
+            "",
+        ]
+    lines += [
+        "## Files",
+        "",
+        "- `trajectory_solute_aligned.xyz`: solute-only coordinates aligned on the",
+        "  configured atom selection; intended for TDO and complex geometry.",
+        "- `trajectory_full_aligned_on_solute.xyz`: the same solute-derived rigid",
+        "  transform applied to every atom; intended for solvent-relative views.",
+        "- `trajectory_full_coordinates.xyz`: retained frames without alignment.",
+        "- `trajectory_solute_coordinates.xyz`: unaligned solute-only frames.",
+        "- `reference_topology.pdb`: atom names/residue identity when available; no",
+        "  Zn-ligand connectivity is inferred.",
+        "- `atom_map.csv`: one-based mapping for TRAVIS and VMD selections.",
+        "",
+        "Files dependent on `n_solute` or a valid alignment selection are omitted",
+        "when that information is unavailable. Adjust the example analysis path if",
+        "a non-default `--output-dir` was used.",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def write_vmd_support(vmd_dir):
+    vmd_dir.mkdir(parents=True, exist_ok=True)
+    script_path = vmd_dir / "convert_xyz_to_dcd.tcl"
+    script_path.write_text(
+        "set script_dir [file dirname [file normalize [info script]]]\n"
+        "set topology [file join $script_dir .. travis reference_topology.pdb]\n"
+        "set trajectory [file join $script_dir .. travis trajectory_full_aligned_on_solute.xyz]\n"
+        "set output [file join $script_dir trajectory_full_aligned_on_solute.dcd]\n"
+        "set molid [mol new $topology type pdb waitfor all]\n"
+        "mol addfile $trajectory type xyz waitfor all molid $molid\n"
+        "animate delete beg 0 end 0 $molid\n"
+        "animate write dcd $output beg 0 end -1 skip 1 waitfor all $molid\n"
+        "quit\n"
+    )
+    readme_path = vmd_dir / "README_VMD.md"
+    readme_path.write_text(
+        "# VMD conversion helper\n\n"
+        "Run manually from the repository or analysis directory:\n\n"
+        "```bash\n"
+        "vmd -dispdev text -e vmd/convert_xyz_to_dcd.tcl\n"
+        "```\n\n"
+        "The helper loads the PDB for topology, adds the aligned coordinate-only\n"
+        "XYZ, removes the initial PDB coordinate frame, and writes\n"
+        "`trajectory_full_aligned_on_solute.dcd`. The DCD contains coordinates\n"
+        "only and must be loaded together with `reference_topology.pdb`. It is\n"
+        "intended primarily for VMD, not TRAVIS. The helper is never executed\n"
+        "automatically.\n"
+    )
+    return [script_path, readme_path]
 
 
 def load_pyplot():
@@ -944,6 +1487,25 @@ def parser():
     p.add_argument("--radial-rmax-A", type=float, default=6.0)
     p.add_argument("--no-rmsd", action="store_true")
     p.add_argument("--no-travis-export", action="store_true")
+    p.add_argument(
+        "--alignment-selection",
+        choices=("solute-heavy", "solute-all"),
+        default="solute-heavy",
+        help="Atoms used for aligned exports (default: solute-heavy)",
+    )
+    p.add_argument(
+        "--alignment-indices",
+        type=parse_alignment_indices,
+        help="Explicit one-based alignment selection, e.g. 1-5,10,12-19",
+    )
+    p.add_argument(
+        "--export-stride",
+        type=int,
+        default=1,
+        help="Export every Nth analyzed frame (default: 1)",
+    )
+    p.add_argument("--export-start-ps", type=float)
+    p.add_argument("--export-end-ps", type=float)
     p.add_argument("--no-plots", action="store_true",
                    help="Do not generate diagnostic plots")
     p.add_argument("--plot-format", choices=("png", "pdf", "svg"), default="png",
@@ -959,6 +1521,11 @@ def main():
     args = parser().parse_args()
     if args.stride < 1 or args.discard_first_ps < 0:
         raise SystemExit("Invalid stride/discard")
+    if args.export_stride < 1:
+        raise SystemExit("--export-stride must be >= 1")
+    if (args.export_start_ps is not None and args.export_end_ps is not None
+            and args.export_end_ps < args.export_start_ps):
+        raise SystemExit("--export-end-ps must be >= --export-start-ps")
     if args.plot_dpi < 1:
         raise SystemExit("--plot-dpi must be >= 1")
     if (args.water_enter_A is None) != (args.water_exit_A is None):
@@ -967,6 +1534,12 @@ def main():
         raise SystemExit("--water-exit-A must be larger than --water-enter-A")
 
     specs, topology_path, nsolute = trajectory_specs(args)
+    if (not args.no_travis_export
+            and (args.export_start_ps is not None or args.export_end_ps is not None)
+            and not all(spec.dt_fs is not None for spec in specs)):
+        raise SystemExit(
+            "--export-start-ps/--export-end-ps require known frame timing"
+        )
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     topology = parse_pdb(topology_path) if topology_path else None
@@ -977,12 +1550,42 @@ def main():
     nat = len(first.elements)
     if topology and len(topology) != nat:
         raise RuntimeError("Topology and trajectory atom counts differ")
+    if topology:
+        mismatches = [
+            i + 1 for i, atom in enumerate(topology)
+            if atom.element != first.elements[i]
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "Topology and trajectory element/order differ at atom indices: "
+                f"{mismatches[:10]}"
+            )
+    if nsolute is not None and not 1 <= nsolute <= nat:
+        raise RuntimeError(f"n_solute must be between 1 and {nat}")
     zn = unique_zn(first.elements, args.zn_index)
     if not 0 <= zn < nat:
         raise RuntimeError("Zn index out of range")
     for s in args.site:
         if s.index0 >= nat:
             raise RuntimeError(f"Site {s.label} index out of range")
+
+    if args.no_travis_export:
+        alignment_indices = None
+        alignment_metadata = {
+            "mode": "explicit-indices" if args.alignment_indices is not None
+                    else args.alignment_selection,
+            "indices_one_based": [],
+            "available": False,
+            "reason": "coordinate export disabled by --no-travis-export",
+        }
+    else:
+        alignment_indices, alignment_metadata = resolve_alignment_selection(
+            first.elements,
+            first.xyz,
+            nsolute,
+            args.alignment_selection,
+            args.alignment_indices,
+        )
 
     water_names = DEFAULT_WATER_RESNAMES | {x.upper() for x in args.water_resname}
     water_O, warnings = water_oxygens(topology, first.elements, nsolute, water_names)
@@ -1012,10 +1615,42 @@ def main():
     if water_O and args.water_enter_A is not None:
         tracker = ResidenceTracker(water_O, args.water_enter_A, args.water_exit_A)
 
-    travis = None if args.no_travis_export else (out / "trajectory_for_travis.xyz").open("w")
+    if args.replica:
+        system_label = args.replica.resolve().parent.name
+    elif len(specs) == 1:
+        system_label = specs[0].path.stem
+    else:
+        system_label = "multiple_sources"
+
+    exporter = None
+    if not args.no_travis_export:
+        exporter = CoordinateExporter(
+            output_dir=out / "travis",
+            nsolute=nsolute,
+            alignment_indices=alignment_indices,
+            alignment_mode=alignment_metadata["mode"],
+            system=system_label,
+        )
+        if nsolute is None:
+            warnings.append(
+                "n_solute is unavailable; solute-only coordinate exports were skipped."
+            )
+        if alignment_indices is None:
+            warnings.append(
+                "Alignment selection is unavailable; aligned coordinate exports were skipped."
+            )
+    elif (out / "travis").exists() or (out / "vmd").exists() or (
+        out / "trajectory_for_travis.xyz"
+    ).exists():
+        warnings.append(
+            "Existing TRAVIS/VMD export files were left untouched because "
+            "--no-travis-export was supplied."
+        )
+
     time_offset = 0.0
     final_time = 0.0
     analyzed = 0
+    export_window_frames = 0
     source_velocity_stats = []
 
     try:
@@ -1035,6 +1670,7 @@ def main():
                     continue
                 analyzed += 1
                 time_ps = time_offset + local_ps if spec.dt_fs is not None else float(analyzed-1)
+                export_time_ps = time_ps if spec.dt_fs is not None else None
                 final_time = time_ps
                 z = fr.xyz[zn]
                 row = {"global_frame": analyzed-1, "source_frame": fr.index, "stage": spec.stage,
@@ -1042,6 +1678,16 @@ def main():
                        "energy_Eh_from_trj": fr.metadata.get("energy", ""),
                        "gnorm_from_trj": fr.metadata.get("gnorm", ""),
                        "has_velocities": fr.velocities is not None}
+
+                if (exporter is not None
+                        and alignment_indices is not None
+                        and exporter.reference_xyz is None):
+                    exporter.set_reference(fr.xyz, {
+                        "stage": spec.stage,
+                        "source_frame": fr.index,
+                        "global_frame": analyzed - 1,
+                        "time_ps": export_time_ps,
+                    })
 
                 named_dist = []
                 contacts = []
@@ -1096,9 +1742,24 @@ def main():
                     rmsf_n += 1
 
                 rows.append(row)
-                if travis:
-                    write_xyz_frame(travis, fr.elements, fr.xyz,
-                                    f"stage={spec.stage} frame={fr.index} time_ps={time_ps:.6f}")
+                if exporter is not None:
+                    in_export_window = (
+                        (args.export_start_ps is None
+                         or export_time_ps >= args.export_start_ps)
+                        and (args.export_end_ps is None
+                             or export_time_ps <= args.export_end_ps)
+                    )
+                    if in_export_window:
+                        if export_window_frames % args.export_stride == 0:
+                            exporter.write(
+                                fr.elements,
+                                fr.xyz,
+                                spec.stage,
+                                fr.index,
+                                analyzed - 1,
+                                export_time_ps,
+                            )
+                        export_window_frames += 1
             if spec.dt_fs is not None:
                 time_offset += seen * spec.dt_fs / 1000.0
             layout = velocity_layout(seen, frames_with_velocities)
@@ -1115,8 +1776,8 @@ def main():
                     "verify trajectory concatenation and completeness."
                 )
     finally:
-        if travis:
-            travis.close()
+        if exporter is not None:
+            exporter.close()
 
     if not rows:
         raise RuntimeError("No frames retained")
@@ -1212,19 +1873,135 @@ def main():
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
 
+    sources_metadata = [
+        {
+            "path": str(spec.path),
+            "sha256": sha256(spec.path),
+            "stage": spec.stage,
+            "frame_dt_fs": spec.dt_fs,
+            **velocity_stats,
+        }
+        for spec, velocity_stats in zip(specs, source_velocity_stats)
+    ]
+
+    travis_export_summary = {
+        "enabled": exporter is not None,
+        "directory": str(out / "travis") if exporter is not None else None,
+        "exported_frames": 0,
+        "metadata_path": None,
+        "generated_files": [],
+    }
+    if exporter is not None:
+        if exporter.exported_frames == 0:
+            raise RuntimeError(
+                "No analyzed frames matched the requested export time window"
+            )
+
+        validations = {}
+        for name, path in exporter.paths.items():
+            expected_atoms = nsolute if name.startswith("solute_") else nat
+            validations[str(path.relative_to(out))] = validate_coordinate_xyz(
+                path,
+                exporter.exported_frames,
+                expected_atoms,
+            )
+
+        legacy_path = out / "trajectory_for_travis.xyz"
+        shutil.copy2(exporter.paths["full_coordinates"], legacy_path)
+        validations[str(legacy_path.relative_to(out))] = validate_coordinate_xyz(
+            legacy_path,
+            exporter.exported_frames,
+            nat,
+        )
+
+        topology_output = out / "travis" / "reference_topology.pdb"
+        topology_provenance = prepare_reference_topology(
+            topology_output,
+            topology_path,
+            first,
+        )
+        atom_map_path = out / "travis" / "atom_map.csv"
+        write_atom_map(
+            atom_map_path,
+            first.elements,
+            topology,
+            nsolute,
+            water_O,
+            zn,
+            args.site,
+        )
+        travis_readme = out / "travis" / "README_TRAVIS.md"
+        write_travis_readme(travis_readme, system_label, exporter.paths)
+
+        generated_files = list(exporter.paths.values()) + [
+            legacy_path,
+            topology_output,
+            atom_map_path,
+            travis_readme,
+        ]
+        if "full_aligned_on_solute" in exporter.paths:
+            generated_files.extend(write_vmd_support(out / "vmd"))
+
+        export_metadata_path = out / "travis" / "travis_export_metadata.json"
+        generated_files.append(export_metadata_path)
+        export_metadata = {
+            "program": "xtb_analysis.py",
+            "version": "0.3",
+            "sources": sources_metadata,
+            "stages": [spec.stage for spec in specs],
+            "dt_fs": [spec.dt_fs for spec in specs],
+            "frames_read": velocity_frames_total,
+            "analyzed_frame_count": len(rows),
+            "exported_frame_count": exporter.exported_frames,
+            "export_stride": args.export_stride,
+            "requested_start_ps": args.export_start_ps,
+            "requested_end_ps": args.export_end_ps,
+            "first_exported_time_ps": exporter.first_exported_time_ps,
+            "last_exported_time_ps": exporter.last_exported_time_ps,
+            "n_atoms": nat,
+            "n_solute": nsolute,
+            "coordinate_units": "angstrom",
+            "velocity_blocks": {
+                "status": velocity_status,
+                "frames_with_velocities": velocity_frames_with,
+                "frames_total": velocity_frames_total,
+            },
+            "velocities_exported": False,
+            "alignment": {
+                "performed": alignment_indices is not None,
+                "selection": alignment_metadata,
+                "reference_frame": exporter.reference_frame,
+                "transform_application": (
+                    "One rigid transform fitted on the selected atoms is "
+                    "applied unchanged to every atom in each full frame."
+                    if alignment_indices is not None else None
+                ),
+            },
+            "topology_provenance": topology_provenance,
+            "generated_files": [
+                str(path.relative_to(out)) for path in generated_files
+            ],
+            "xyz_validation": validations,
+            "interpretation": (
+                "The exported XYZ/PDB files contain coordinates only. "
+                "Velocity records present in xtb.trj were intentionally omitted."
+            ),
+        }
+        export_metadata_path.write_text(json.dumps(export_metadata, indent=2))
+        travis_export_summary = {
+            "enabled": True,
+            "directory": str(out / "travis"),
+            "exported_frames": exporter.exported_frames,
+            "metadata_path": str(export_metadata_path),
+            "generated_files": [
+                str(path.relative_to(out)) for path in generated_files
+            ],
+        }
+
     meta = {
         "program": "xtb_analysis.py",
-        "version": "0.2",
-        "sources": [
-            {
-                "path": str(spec.path),
-                "sha256": sha256(spec.path),
-                "stage": spec.stage,
-                "frame_dt_fs": spec.dt_fs,
-                **velocity_stats,
-            }
-            for spec, velocity_stats in zip(specs, source_velocity_stats)
-        ],
+        "version": "0.3",
+        "sources": sources_metadata,
         "topology": {"path": str(topology_path), "sha256": sha256(topology_path)} if topology_path else None,
         "n_atoms": nat, "n_solute_atoms": nsolute, "Zn_index": zn+1,
         "water_O_indices": [i+1 for i in water_O],
@@ -1249,6 +2026,7 @@ def main():
                 "were not used in the current structural analyses."
             )
         },
+        "travis_export": travis_export_summary,
         "plotting": {
             "enabled": not args.no_plots,
             "format": args.plot_format,
@@ -1269,10 +2047,13 @@ def main():
 
     print(f"Analyzed frames : {len(rows)}")
     print(f"Atoms           : {nat}")
+    print(f"Solute atoms    : {nsolute if nsolute is not None else 'unknown'}")
     print(f"Zn index        : {zn+1}")
     print(f"Water oxygens   : {len(water_O)}")
     print(f"Velocity blocks : {velocity_status}")
     print(f"Output          : {out}")
+    if exporter is not None:
+        print(f"Exported frames : {exporter.exported_frames}")
     if not args.no_plots:
         print(f"Plots           : {len(generated_plots)} in {plot_dir}")
     for w in warnings:

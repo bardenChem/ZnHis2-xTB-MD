@@ -139,6 +139,62 @@ when possible, preserves its recorded historical duration, and prints an
 explicit warning that the restart came from an earlier duration configuration.
 Do not add `--force` or `--repack`.
 
+## Optional 20 ps continuation at 298.15 K
+
+`05_298K_extended` is an opt-in continuation of the validated final
+`mdrestart` from `04_298K_screen`. Normal preparation, `--run`, and `--resume`
+still stop at stage 04; they do not launch the extra 20 ps automatically. The
+continuation keeps the stage-04 Hamiltonian, charge/UHF, NVT settings, physical
+H masses, SHAKE setting, 0.5 fs timestep, 10 fs dump interval, and the same
+spherical wall. It uses `restart=true`, so coordinates and velocities come
+directly from `stages/04_298K_screen/mdrestart`; no packing, optimization,
+temperature ramp, velocity randomization, or solvation rebuild is performed.
+
+For the currently completed `replica_01` data, whose manifests record 25
+threads, validate all three priority systems without writing files or calling
+xTB:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system O6_I T4_cristal T4_IV_Hudecova \
+    --project md_screening \
+    --replicas 1 \
+    --threads 25 \
+    --start-stage 05_298K_extended \
+    --dry-run
+```
+
+Execute the extension only after inspecting the dry-run:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system O6_I T4_cristal T4_IV_Hudecova \
+    --project md_screening \
+    --replicas 1 \
+    --threads 25 \
+    --start-stage 05_298K_extended \
+    --run
+```
+
+Individual commands use the same interface:
+
+```bash
+python3 xtb_md_pipeline.py --system O6_I --project md_screening \
+    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+python3 xtb_md_pipeline.py --system T4_cristal --project md_screening \
+    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+python3 xtb_md_pipeline.py --system T4_IV_Hudecova --project md_screening \
+    --replicas 1 --threads 25 --start-stage 05_298K_extended --run
+```
+
+Use the exact thread count and other physical settings recorded by each
+existing replica manifest; provenance mismatches abort. A valid stage-05
+`stage.done` is reused by default. `stage.failed`, `stage.running`, or an
+unmarked nonempty archive aborts without overwriting it. To deliberately retry
+only stage 05 while retaining stage 04, add `--force` to the stage-05 command.
+The preflight also validates the complete 01--04 chain, restart coordinates and
+velocities, composition, hashes, and a conservative free-disk estimate.
+
 The workflow is:
 
 ```text
@@ -148,6 +204,7 @@ Packmol spherical droplet
   -> 02_200K          2 ps  intermediate heating (not production)
   -> 03_298K_equil    3 ps  final-temperature equilibration
   -> 04_298K_screen   5 ps  structural screening at 298.15 K
+  -> 05_298K_extended 20 ps optional direct continuation at 298.15 K
 ```
 
 `04_298K_screen` has `restart=true` and receives positions and velocities from
@@ -247,10 +304,19 @@ md_screening/
     │   ├── 02_200K.inp
     │   ├── 03_298K_equil.inp
     │   ├── 04_298K_screen.inp
+    │   ├── 05_298K_extended.inp
     │   └── stages/
-    │       └── 00_relax/
-    │           ├── 00_relax.out
-    │           ├── xtbopt.*
+    │       ├── 00_relax/
+    │       │   ├── 00_relax.out
+    │       │   ├── xtbopt.*
+    │       │   └── stage.done
+    │       └── 05_298K_extended/       # only when explicitly requested
+    │           ├── 05_298K_extended.inp
+    │           ├── 05_298K_extended.out
+    │           ├── xtb.trj
+    │           ├── mdrestart.input
+    │           ├── mdrestart
+    │           ├── stage_manifest.json
     │           └── stage.done
     └── replica_02/
 ```
@@ -264,6 +330,8 @@ Per replica:
 - intermediate heating at 200 K, 2.0 ps (4000 steps; not production)
 - 298.15 K equilibration, 3.0 ps (6000 steps)
 - 298.15 K structural screening, 5.0 ps (10000 steps)
+- optional 298.15 K extension, 20.0 ps (40000 steps; approximately 2000
+  frames, allowing the xTB initial/final-frame convention)
 
 The times in ps are the source of truth; step counts above are derived from the
 0.5 fs timestep. GFN2-xTB remains the default, with physical H masses and SHAKE
@@ -280,7 +348,7 @@ xTB layout in which each coordinate block is followed by one three-component
 velocity record per atom. Velocities are preserved in `Frame.velocities`, while
 `frames.csv` and `analysis_metadata.json` record their presence. They are not
 used in the current structural analyses, no physical unit is assigned, and
-`trajectory_for_travis.xyz` continues to contain coordinates only.
+all TRAVIS/VMD exports contain coordinates only.
 
 Analyze the default screening stage of one replica:
 
@@ -291,6 +359,24 @@ python3 xtb_analysis.py \
     --discard-first-ps 1.0 \
     --output-dir analysis/O6_I
 ```
+
+Analyze stages 04 and 05 on one continuous output time axis:
+
+```bash
+python3 xtb_analysis.py \
+    --replica md_screening/O6_I/replica_01 \
+    --stage 04_298K_screen \
+    --stage 05_298K_extended \
+    --discard-first-ps 1.0 \
+    --n-solute 39 \
+    --output-dir analysis/O6_I_25ps
+```
+
+The current analyzer applies `--discard-first-ps` independently to every input
+trajectory. Thus the command above discards 1 ps from stage 04 **and** 1 ps
+from stage 05, even though the retained frames receive a continuous time axis.
+There is currently no option to discard only from the first stage; this
+behavior was documented here and was not changed as part of the MD extension.
 
 Run numerical analysis without loading Matplotlib or creating graphics:
 
@@ -330,6 +416,27 @@ The plotting options are:
 --plot-dir PATH               default: <output-dir>/plots
 ```
 
+Coordinate export is enabled unless `--no-travis-export` is supplied. The
+default alignment uses all non-hydrogen solute atoms. Export selection can be
+controlled independently of the analysis tables:
+
+```text
+--alignment-selection {solute-heavy,solute-all}
+--alignment-indices 1-5,10,12-19
+--export-stride N
+--export-start-ps START
+--export-end-ps END
+--no-travis-export
+```
+
+`--alignment-indices` overrides the named alignment selection and uses one-based
+indices. At least three non-collinear atoms are required. The alignment
+reference is the first analyzed frame; one Kabsch transform fitted on the
+selected atoms is applied unchanged to every atom, including water. The
+start/end window is inclusive, and `--export-stride` is applied after the main
+analysis stride to frames inside that window. It does not remove rows from
+`frames.csv`.
+
 Outputs are conditional on the available data and requested analyses:
 
 ```text
@@ -343,6 +450,18 @@ analysis/O6_I/
 ├── solute_RMSF.csv
 ├── analysis_metadata.json
 ├── trajectory_for_travis.xyz
+├── travis/
+│   ├── trajectory_full_coordinates.xyz
+│   ├── trajectory_full_aligned_on_solute.xyz
+│   ├── trajectory_solute_coordinates.xyz
+│   ├── trajectory_solute_aligned.xyz
+│   ├── reference_topology.pdb
+│   ├── atom_map.csv
+│   ├── travis_export_metadata.json
+│   └── README_TRAVIS.md
+├── vmd/
+│   ├── convert_xyz_to_dcd.tcl
+│   └── README_VMD.md
 └── plots/
     ├── coordination_distances_vs_time.png
     ├── Zn_<group>_distances_vs_time.png
@@ -364,6 +483,22 @@ analysis/O6_I/
         ├── CN_smooth_histogram.png
         └── tetrahedrality_histogram.png
 ```
+
+The four XYZ variants have distinct roles:
+
+- `full_coordinates`: all atoms without transformation;
+- `full_aligned_on_solute`: all atoms transformed using the solute-derived fit,
+  suitable for solvent-relative inspection, SDF/TDO preparation, and videos;
+- `solute_coordinates`: only the fixed first `n_solute` atoms, unaligned;
+- `solute_aligned`: only the solute after the same configured fit, suitable for
+  TDO and clean complex visualization.
+
+The root `trajectory_for_travis.xyz` remains a byte-identical compatibility copy
+of `travis/trajectory_full_coordinates.xyz`. Solute-dependent files are omitted
+when `n_solute` is unknown, and aligned files are omitted when a valid alignment
+selection cannot be constructed. `reference_topology.pdb` is copied from the
+analysis topology when available; otherwise a minimal PDB is generated without
+`CONECT` records. The generated VMD Tcl helper is never executed automatically.
 
 Hard coordination numbers and states are calculated only when the user supplies
 `--contact-cutoff-A`; the program does not assume a universal chemical cutoff.
