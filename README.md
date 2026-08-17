@@ -197,6 +197,112 @@ only stage 05 while retaining stage 04, add `--force` to the stage-05 command.
 The preflight also validates the complete 01--04 chain, restart coordinates and
 velocities, composition, hashes, and a conservative free-disk estimate.
 
+## Independent CO2 shell screening
+
+`--co2-shell-screen` activates a separate workflow that starts from one
+representative **full-droplet** PDB (Zn(His)2 plus all explicit waters), adds
+neutral CO2 molecules around Zn with Packmol, and can then optimize only the
+water and CO2 atoms with xTB. It is a new structural condition: it does not use
+`mdrestart`, preserve velocities, or dynamically continue stage 05. The two CO2
+stage names are deliberately not members of the aqueous `STAGES` sequence.
+
+The source must retain the pipeline atom layout: the first 39 atoms are the
+biomimetic by default, followed by complete three-atom water groups. The code
+checks the registered system's solute element sequence, exactly one Zn in the
+solute block, and one O plus two H atoms in every solvent triplet. A clustering
+analysis may identify the medoid index, but the supplied PDB must be the
+corresponding frame extracted from the **full** trajectory, not a solute-only
+clustering export.
+
+Prepare and validate three independent Packmol placements for each requested
+CO2 count:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system T4_cristal \
+    --co2-shell-screen \
+    --co2-source-pdb medoids/T4_cristal_full_medoid.pdb \
+    --co2-pdb co2.pdb \
+    --co2-counts 1 2 4 8 \
+    --co2-shell-inner 4.0 \
+    --co2-shell-outer 6.0 \
+    --co2-pack-replicas 3 \
+    --co2-project co2_screening
+```
+
+Without `--run`, this command still runs Packmol for every count/packing,
+validates composition, fixed source coordinates, and all initial Zn--C shell
+distances, writes manifests and `packing_summary.tsv`, and then stops for visual
+inspection. Packmol constrains the template's carbon atom with an `atoms ...`
+selection containing `outside sphere` and `inside sphere`; the source is fixed
+at its already centered coordinates. This follows the documented classic
+[Packmol atom-selection and spherical-constraint syntax](https://m3g.github.io/packmol/userguide.shtml).
+The three-atom CO2 template is treated as rigid by Packmol and must contain one
+C, two O, nonzero C--O distances, and an O--C--O angle of at least 170 degrees.
+
+After inspecting every `system_CO2_centered.pdb`, repeat the same command with
+the desired xTB allocation and `--run`:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system T4_cristal \
+    --co2-shell-screen \
+    --co2-source-pdb medoids/T4_cristal_full_medoid.pdb \
+    --co2-pdb co2.pdb \
+    --co2-counts 1 2 4 8 \
+    --co2-shell-inner 4.0 \
+    --co2-shell-outer 6.0 \
+    --co2-pack-replicas 3 \
+    --co2-project co2_screening \
+    --threads 64 \
+    --run \
+    --xtb /path/to/xtb
+```
+
+`07_CO2_accommodation` uses the selected GFN/charge/UHF/ALPB settings, a
+spherical log-Fermi wall recalculated from the final CO2-containing system,
+and defaults to `--opt loose --cycles 30`. The first
+`--co2-solute-atoms 39` atoms remain fixed; water and CO2 are mobile. CO2 may
+leave the initial shell during optimization without making the result invalid.
+Initial/final Zn--C and water-O--CO2-C distances, conservatively parsed energies,
+and convergence status are recorded without automatic chemical interpretation.
+
+The deterministic output layout is:
+
+```text
+co2_screening/<SYSTEM>/
+├── packing_summary.tsv
+├── accommodation_summary.tsv
+└── NCO2_XX/
+    └── pack_XX/
+        ├── 06_CO2_shell_pack/
+        │   ├── source_medoid.pdb
+        │   ├── source_centered.pdb
+        │   ├── co2.pdb
+        │   ├── 06_CO2_shell_pack.inp
+        │   ├── 06_CO2_shell_pack.out
+        │   ├── packed_CO2_shell.pdb
+        │   ├── system_CO2_centered.pdb
+        │   ├── stage_manifest.json
+        │   └── stage.done
+        └── 07_CO2_accommodation/
+            ├── system_CO2_centered.pdb
+            ├── 07_CO2_accommodation.inp
+            ├── 07_CO2_accommodation.out
+            ├── system_CO2_accommodated.pdb
+            ├── stage_manifest.json
+            ├── stage.done
+            └── xTB output files when generated
+```
+
+Compatible completed stages print `REUSE`. A changed source hash, CO2 template,
+count, shell, seed, tolerance, optimization setting, wall, or input geometry is
+never silently reused. Use `--co2-repack` to archive and replace stage 06, and
+use `--force --run` to archive and replace stage 07. Changing only `--threads`
+does not invalidate a completed scientific result; the count remains execution
+provenance. The TSV files are rebuilt from manifests in count/packing order, so
+rerunning the command does not append duplicate rows.
+
 The workflow is:
 
 ```text

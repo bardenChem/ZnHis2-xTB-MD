@@ -36,6 +36,7 @@ older Packmol versions that do not support the newer `pbc` keyword.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -168,6 +169,14 @@ EXTENDED_STAGE = STAGES[EXTENDED_STAGE_INDEX]
 EXTENDED_STAGE_NAME = EXTENDED_STAGE["name"]
 EXECUTION_STAGES = ["00_relax", *(stage["name"] for stage in STAGES)]
 EXECUTION_PROVENANCE_ONLY_FIELDS = frozenset({"threads"})
+CO2_PACK_STAGE = "06_CO2_shell_pack"
+CO2_ACCOMMODATION_STAGE = "07_CO2_accommodation"
+CO2_WORKFLOW_NOTE = (
+    "This CO2 workflow is a new condition derived from a previously "
+    "equilibrated aqueous configuration. It is not a dynamical continuation "
+    "of stage 05."
+)
+PDB_COORDINATE_TOLERANCE_A = 0.002
 
 FATAL_MD_PATTERNS = [
     "MD is unstable",
@@ -993,10 +1002,17 @@ def valid_pdb(path: Path, expected_atoms: int) -> bool:
         return False
 
 
-def materialize_relaxed_pdb(replica_dir: Path, expected_atoms: int) -> Path:
+def materialize_relaxed_pdb(
+    replica_dir: Path,
+    expected_atoms: int,
+    *,
+    template_name: str = "system_centered.pdb",
+    destination_name: str = "system_relaxed.pdb",
+    preserve_template_metadata: bool = False,
+) -> Path:
     """Find xTB's optimized geometry and create the operational relaxed PDB."""
-    template = replica_dir / "system_centered.pdb"
-    destination = replica_dir / "system_relaxed.pdb"
+    template = replica_dir / template_name
+    destination = replica_dir / destination_name
 
     for name in ["xtbopt.pdb", "xtblast.pdb"]:
         candidate = replica_dir / name
@@ -1007,7 +1023,15 @@ def materialize_relaxed_pdb(replica_dir: Path, expected_atoms: int) -> Path:
                 raise RuntimeError(
                     f"{name} element sequence differs from input."
                 )
-            shutil.copy2(candidate, destination)
+            if preserve_template_metadata:
+                replace_pdb_coordinates(
+                    template,
+                    [atom["xyz"] for atom in candidate_atoms],
+                    destination,
+                    elements=[atom["element"] for atom in candidate_atoms],
+                )
+            else:
+                shutil.copy2(candidate, destination)
             return destination
 
     errors = []
@@ -3640,6 +3664,1424 @@ def run_replica(replica_dir: Path, args):
 
 
 # ---------------------------------------------------------------------------
+# Independent CO2 shell-screening workflow
+# ---------------------------------------------------------------------------
+
+def _validated_pdb_atoms(path: Path, description: str):
+    try:
+        atoms = pdb_atoms(path)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot read {description} PDB {path}: {exc}"
+        ) from exc
+    for index, atom in enumerate(atoms, start=1):
+        if not all(math.isfinite(value) for value in atom["xyz"]):
+            raise RuntimeError(
+                f"{description} PDB {path} has non-finite coordinates at "
+                f"atom {index}."
+            )
+    return atoms
+
+
+def _element_sequence(atoms) -> list[str]:
+    return [atom["element"] for atom in atoms]
+
+
+def validate_co2_source_pdb(
+    source_pdb: Path,
+    n_solute_atoms: int,
+    expected_solute_pdb: Path | None = None,
+) -> dict:
+    """Validate a full-droplet CO2 source without changing its atom order."""
+    atoms = _validated_pdb_atoms(source_pdb, "CO2 source")
+    if n_solute_atoms <= 0:
+        raise RuntimeError("--co2-solute-atoms must be positive.")
+    if len(atoms) <= n_solute_atoms:
+        raise RuntimeError(
+            f"CO2 source {source_pdb} must contain the {n_solute_atoms} "
+            "solute atoms followed by explicit water."
+        )
+
+    elements = _element_sequence(atoms)
+    zinc_indices = [i for i, element in enumerate(elements) if element == "Zn"]
+    if len(zinc_indices) != 1:
+        raise RuntimeError(
+            f"CO2 source {source_pdb} must contain exactly one Zn atom; "
+            f"found {len(zinc_indices)}."
+        )
+    zinc_index = zinc_indices[0]
+    if zinc_index >= n_solute_atoms:
+        raise RuntimeError(
+            f"The only Zn atom in {source_pdb} is outside the first "
+            f"{n_solute_atoms} solute atoms."
+        )
+
+    solvent_elements = elements[n_solute_atoms:]
+    if len(solvent_elements) % 3:
+        raise RuntimeError(
+            f"The solvent portion of {source_pdb} has "
+            f"{len(solvent_elements)} atoms, which is not divisible by 3."
+        )
+    water_oxygen_indices = []
+    for offset in range(0, len(solvent_elements), 3):
+        triplet = solvent_elements[offset:offset + 3]
+        if sorted(triplet) != ["H", "H", "O"]:
+            first = n_solute_atoms + offset + 1
+            raise RuntimeError(
+                f"Solvent atoms {first}-{first + 2} in {source_pdb} do not "
+                f"form one H2O triplet (elements: {', '.join(triplet)})."
+            )
+        oxygen_local = triplet.index("O")
+        water_oxygen_indices.append(n_solute_atoms + offset + oxygen_local)
+
+    if expected_solute_pdb is not None:
+        expected_atoms = _validated_pdb_atoms(
+            expected_solute_pdb, "registered system solute"
+        )
+        if len(expected_atoms) != n_solute_atoms:
+            raise RuntimeError(
+                f"Registered solute {expected_solute_pdb} has "
+                f"{len(expected_atoms)} atoms, but --co2-solute-atoms is "
+                f"{n_solute_atoms}."
+            )
+        expected_elements = _element_sequence(expected_atoms)
+        if elements[:n_solute_atoms] != expected_elements:
+            mismatch = next(
+                index for index, (observed, expected) in enumerate(
+                    zip(elements[:n_solute_atoms], expected_elements), start=1
+                )
+                if observed != expected
+            )
+            raise RuntimeError(
+                f"CO2 source solute element sequence differs from "
+                f"{expected_solute_pdb} at atom {mismatch}: found "
+                f"{elements[mismatch - 1]}, expected "
+                f"{expected_elements[mismatch - 1]}."
+            )
+
+    return {
+        "source_pdb": str(source_pdb.resolve()),
+        "source_sha256": file_sha256(source_pdb),
+        "n_source_atoms": len(atoms),
+        "n_solute_atoms": n_solute_atoms,
+        "n_water_atoms": len(solvent_elements),
+        "n_waters": len(solvent_elements) // 3,
+        "zinc_index": zinc_index + 1,
+        "water_oxygen_indices": [index + 1 for index in water_oxygen_indices],
+        "element_sequence": elements,
+    }
+
+
+def _angle_degrees(first, vertex, third) -> float:
+    vector_a = tuple(a - b for a, b in zip(first, vertex))
+    vector_b = tuple(c - b for c, b in zip(third, vertex))
+    norm_a = math.sqrt(sum(value * value for value in vector_a))
+    norm_b = math.sqrt(sum(value * value for value in vector_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        raise RuntimeError("Cannot compute a CO2 angle with a zero-length bond.")
+    cosine = sum(a * b for a, b in zip(vector_a, vector_b)) / (
+        norm_a * norm_b
+    )
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def validate_co2_template(co2_pdb: Path) -> dict:
+    atoms = _validated_pdb_atoms(co2_pdb, "CO2 template")
+    elements = _element_sequence(atoms)
+    if len(atoms) != 3 or elements.count("C") != 1 or elements.count("O") != 2:
+        raise RuntimeError(
+            f"CO2 template {co2_pdb} must contain exactly three atoms: "
+            "one C and two O atoms."
+        )
+    carbon_index = elements.index("C")
+    oxygen_indices = [i for i, element in enumerate(elements) if element == "O"]
+    carbon_xyz = atoms[carbon_index]["xyz"]
+    distances = [
+        math.dist(carbon_xyz, atoms[index]["xyz"])
+        for index in oxygen_indices
+    ]
+    if any(distance <= 0.0 for distance in distances):
+        raise RuntimeError(f"CO2 template {co2_pdb} has a zero C-O distance.")
+    angle = _angle_degrees(
+        atoms[oxygen_indices[0]]["xyz"],
+        carbon_xyz,
+        atoms[oxygen_indices[1]]["xyz"],
+    )
+    if angle < 170.0:
+        raise RuntimeError(
+            f"CO2 template {co2_pdb} is not sufficiently linear: "
+            f"O-C-O = {angle:.3f} degrees (minimum 170 degrees)."
+        )
+    return {
+        "co2_pdb": str(co2_pdb.resolve()),
+        "co2_sha256": file_sha256(co2_pdb),
+        "n_atoms": 3,
+        "carbon_local_index": carbon_index + 1,
+        "oxygen_local_indices": [index + 1 for index in oxygen_indices],
+        "co_bond_lengths_A": distances,
+        "oco_angle_degrees": angle,
+        "element_sequence": elements,
+    }
+
+
+def co2_pack_seed(seed_base: int, co2_count: int, pack_index: int) -> int:
+    """Return a stable, positive Packmol seed unique to count/replica pairs."""
+    if seed_base <= 0 or co2_count <= 0 or pack_index <= 0:
+        raise ValueError("CO2 seed base, count, and pack index must be positive.")
+    pair_sum = co2_count + pack_index - 2
+    pairing = pair_sum * (pair_sum + 1) // 2 + pack_index
+    return ((seed_base - 1 + pairing) % 2_147_483_646) + 1
+
+
+def co2_packmol_input(
+    tolerance_A: float,
+    seed: int,
+    co2_count: int,
+    carbon_local_index: int,
+    zinc_xyz,
+    shell_inner_A: float,
+    shell_outer_A: float,
+) -> str:
+    zinc_x, zinc_y, zinc_z = zinc_xyz
+    return f"""tolerance {tolerance_A:.6f}
+filetype pdb
+output packed_CO2_shell.pdb
+seed {seed}
+
+structure source_centered.pdb
+  number 1
+  fixed 0. 0. 0. 0. 0. 0.
+end structure
+
+structure co2.pdb
+  number {co2_count}
+  atoms {carbon_local_index}
+    outside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_inner_A:.6f}
+    inside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_outer_A:.6f}
+  end atoms
+end structure
+"""
+
+
+def _co2_carbon_indices(
+    n_source_atoms: int,
+    co2_count: int,
+    carbon_local_index: int,
+) -> list[int]:
+    carbon_offset = carbon_local_index - 1
+    return [
+        n_source_atoms + molecule * 3 + carbon_offset
+        for molecule in range(co2_count)
+    ]
+
+
+def co2_geometry_metrics(
+    pdb_path: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+) -> dict:
+    atoms = _validated_pdb_atoms(pdb_path, "CO2-screen geometry")
+    expected_atoms = source_metadata["n_source_atoms"] + 3 * co2_count
+    if len(atoms) != expected_atoms:
+        raise RuntimeError(
+            f"{pdb_path} has {len(atoms)} atoms; expected {expected_atoms}."
+        )
+    zinc_index = source_metadata["zinc_index"] - 1
+    carbon_indices = _co2_carbon_indices(
+        source_metadata["n_source_atoms"],
+        co2_count,
+        template_metadata["carbon_local_index"],
+    )
+    zinc_xyz = atoms[zinc_index]["xyz"]
+    zinc_carbon_distances = [
+        math.dist(zinc_xyz, atoms[index]["xyz"])
+        for index in carbon_indices
+    ]
+    water_oxygen_indices = [
+        index - 1 for index in source_metadata["water_oxygen_indices"]
+    ]
+    nearest_water = None
+    for oxygen_index in water_oxygen_indices:
+        for molecule_index, carbon_index in enumerate(carbon_indices, start=1):
+            distance = math.dist(
+                atoms[oxygen_index]["xyz"], atoms[carbon_index]["xyz"]
+            )
+            candidate = (distance, oxygen_index + 1, molecule_index, carbon_index + 1)
+            if nearest_water is None or candidate < nearest_water:
+                nearest_water = candidate
+
+    return {
+        "zn_c_distances_A": zinc_carbon_distances,
+        "zn_c_min_A": min(zinc_carbon_distances),
+        "zn_c_mean_A": sum(zinc_carbon_distances) / len(zinc_carbon_distances),
+        "zn_c_max_A": max(zinc_carbon_distances),
+        "nearest_zn_c_co2_index": (
+            zinc_carbon_distances.index(min(zinc_carbon_distances)) + 1
+        ),
+        "water_o_c_min_A": nearest_water[0] if nearest_water else None,
+        "nearest_water_oxygen_atom_index": (
+            nearest_water[1] if nearest_water else None
+        ),
+        "nearest_water_o_c_co2_index": (
+            nearest_water[2] if nearest_water else None
+        ),
+        "nearest_water_o_c_carbon_atom_index": (
+            nearest_water[3] if nearest_water else None
+        ),
+    }
+
+
+def validate_co2_packed_geometry(
+    source_centered_pdb: Path,
+    packed_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+    shell_inner_A: float,
+    shell_outer_A: float,
+    coordinate_tolerance_A: float = PDB_COORDINATE_TOLERANCE_A,
+) -> dict:
+    source_atoms = _validated_pdb_atoms(source_centered_pdb, "centered source")
+    packed_atoms = _validated_pdb_atoms(packed_pdb, "Packmol CO2 output")
+    expected_count = len(source_atoms) + 3 * co2_count
+    if len(packed_atoms) != expected_count:
+        raise RuntimeError(
+            f"Packmol CO2 output has {len(packed_atoms)} atoms; expected "
+            f"{expected_count}."
+        )
+    expected_elements = _element_sequence(source_atoms) + (
+        template_metadata["element_sequence"] * co2_count
+    )
+    observed_elements = _element_sequence(packed_atoms)
+    if observed_elements != expected_elements:
+        mismatch = next(
+            index for index, (observed, expected) in enumerate(
+                zip(observed_elements, expected_elements), start=1
+            )
+            if observed != expected
+        )
+        raise RuntimeError(
+            f"Packmol CO2 atom ordering/composition differs at atom "
+            f"{mismatch}: found {observed_elements[mismatch - 1]}, expected "
+            f"{expected_elements[mismatch - 1]}."
+        )
+
+    source_displacements = [
+        math.dist(source["xyz"], packed["xyz"])
+        for source, packed in zip(source_atoms, packed_atoms)
+    ]
+    max_source_displacement = max(source_displacements)
+    if max_source_displacement > coordinate_tolerance_A:
+        raise RuntimeError(
+            "Packmol changed the fixed source geometry by "
+            f"{max_source_displacement:.6f} A (allowed "
+            f"{coordinate_tolerance_A:.6f} A)."
+        )
+
+    metrics = co2_geometry_metrics(
+        packed_pdb, source_metadata, template_metadata, co2_count
+    )
+    outside = [
+        (index, distance) for index, distance in enumerate(
+            metrics["zn_c_distances_A"], start=1
+        )
+        if distance < shell_inner_A - coordinate_tolerance_A
+        or distance > shell_outer_A + coordinate_tolerance_A
+    ]
+    if outside:
+        detail = ", ".join(
+            f"CO2 {index}: {distance:.6f} A" for index, distance in outside
+        )
+        raise RuntimeError(
+            f"Packmol placed CO2 carbon(s) outside the requested Zn shell "
+            f"[{shell_inner_A:.6f}, {shell_outer_A:.6f}] A: {detail}."
+        )
+
+    n_source = source_metadata["n_source_atoms"]
+    co2_atoms = packed_atoms[n_source:]
+    min_co2_source = min(
+        math.dist(co2_atom["xyz"], source_atom["xyz"])
+        for co2_atom in co2_atoms
+        for source_atom in source_atoms
+    )
+    min_co2_co2 = None
+    if co2_count > 1:
+        min_co2_co2 = min(
+            math.dist(
+                co2_atoms[first_molecule * 3 + first_atom]["xyz"],
+                co2_atoms[second_molecule * 3 + second_atom]["xyz"],
+            )
+            for first_molecule in range(co2_count)
+            for second_molecule in range(first_molecule + 1, co2_count)
+            for first_atom in range(3)
+            for second_atom in range(3)
+        )
+
+    return {
+        "atom_count_valid": True,
+        "element_order_valid": True,
+        "source_coordinates_preserved": True,
+        "source_max_displacement_A": max_source_displacement,
+        "coordinate_tolerance_A": coordinate_tolerance_A,
+        "shell_valid": True,
+        "minimum_CO2_source_distance_A": min_co2_source,
+        "minimum_CO2_CO2_distance_A": min_co2_co2,
+        "metrics": metrics,
+    }
+
+
+def validate_co2_centered_geometry(
+    packed_pdb: Path,
+    centered_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+    shell_inner_A: float | None = None,
+    shell_outer_A: float | None = None,
+) -> dict:
+    packed_atoms = _validated_pdb_atoms(packed_pdb, "packed CO2 geometry")
+    centered_atoms = _validated_pdb_atoms(centered_pdb, "centered CO2 geometry")
+    if _element_sequence(packed_atoms) != _element_sequence(centered_atoms):
+        raise RuntimeError("Final centering changed the CO2-system element order.")
+    before = co2_geometry_metrics(
+        packed_pdb, source_metadata, template_metadata, co2_count
+    )
+    after = co2_geometry_metrics(
+        centered_pdb, source_metadata, template_metadata, co2_count
+    )
+    maximum_change = max(
+        abs(first - second) for first, second in zip(
+            before["zn_c_distances_A"], after["zn_c_distances_A"]
+        )
+    )
+    if maximum_change > 2 * PDB_COORDINATE_TOLERANCE_A:
+        raise RuntimeError(
+            "Centering changed a Zn-C distance by "
+            f"{maximum_change:.6f} A, beyond PDB precision tolerance."
+        )
+    if (shell_inner_A is None) != (shell_outer_A is None):
+        raise ValueError("Both centered-shell bounds must be provided together.")
+    if shell_inner_A is not None:
+        shell_tolerance = 2 * PDB_COORDINATE_TOLERANCE_A
+        outside = [
+            (index, distance) for index, distance in enumerate(
+                after["zn_c_distances_A"], start=1
+            )
+            if distance < shell_inner_A - shell_tolerance
+            or distance > shell_outer_A + shell_tolerance
+        ]
+        if outside:
+            raise RuntimeError(
+                "Final centering did not preserve the validated Zn-C shell: "
+                + ", ".join(
+                    f"CO2 {index}: {distance:.6f} A"
+                    for index, distance in outside
+                )
+            )
+    return {
+        "element_order_valid": True,
+        "maximum_zn_c_distance_change_A": maximum_change,
+        "shell_revalidated": shell_inner_A is not None,
+        "metrics": after,
+    }
+
+
+def _read_json_dict(path: Path, description: str) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read {description} {path}.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid {description} {path}: expected an object.")
+    return data
+
+
+def _write_json(path: Path, data: dict):
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def co2_condition_dir(
+    co2_project: Path,
+    system_name: str,
+    co2_count: int,
+    pack_index: int,
+) -> Path:
+    return (
+        co2_project
+        / system_name
+        / f"NCO2_{co2_count:02d}"
+        / f"pack_{pack_index:02d}"
+    )
+
+
+def _co2_stage_active_entries(stage_dir: Path) -> list[Path]:
+    if not stage_dir.exists():
+        return []
+    return sorted(
+        (path for path in stage_dir.iterdir() if path.name != "attempts"),
+        key=lambda path: path.name,
+    )
+
+
+def archive_co2_stage_attempt(stage_dir: Path, reason: str) -> Path | None:
+    """Move a prior attempt aside without deleting scientific outputs."""
+    entries = _co2_stage_active_entries(stage_dir)
+    if not entries:
+        return None
+    attempts_dir = stage_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    archive = attempts_dir / stamp
+    suffix = 1
+    while archive.exists():
+        archive = attempts_dir / f"{stamp}_{suffix:02d}"
+        suffix += 1
+    archive.mkdir()
+    for path in entries:
+        shutil.move(str(path), archive / path.name)
+    (archive / "archive_reason.txt").write_text(reason.rstrip() + "\n")
+    return archive
+
+
+def _validate_co2_output_hashes(stage_dir: Path, manifest: dict):
+    output_hashes = manifest.get("output_sha256")
+    if not isinstance(output_hashes, dict) or not output_hashes:
+        raise RuntimeError(
+            f"CO2 stage manifest in {stage_dir} has no output SHA-256 map."
+        )
+    for filename, recorded_hash in output_hashes.items():
+        path = stage_dir / filename
+        if not path.is_file():
+            raise RuntimeError(
+                f"Completed CO2 stage {stage_dir} is missing {filename}."
+            )
+        if file_sha256(path) != recorded_hash:
+            raise RuntimeError(
+                f"Completed CO2 stage output changed after validation: {path}."
+            )
+
+
+def co2_pack_configuration(
+    system_name: str,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+    pack_index: int,
+    seed: int,
+    args,
+) -> dict:
+    return {
+        "stage": CO2_PACK_STAGE,
+        "system": system_name,
+        "source_sha256": source_metadata["source_sha256"],
+        "source_atom_count": source_metadata["n_source_atoms"],
+        "solute_atom_count": source_metadata["n_solute_atoms"],
+        "water_count": source_metadata["n_waters"],
+        "co2_template_sha256": template_metadata["co2_sha256"],
+        "co2_carbon_local_index": template_metadata["carbon_local_index"],
+        "co2_count": co2_count,
+        "pack_index": pack_index,
+        "packmol_seed": seed,
+        "packmol_tolerance_A": args.packmol_tolerance,
+        "shell_inner_A": args.co2_shell_inner,
+        "shell_outer_A": args.co2_shell_outer,
+        "wall_margin_A": args.wall_margin,
+    }
+
+
+def validate_completed_co2_pack(
+    stage_dir: Path,
+    expected_configuration: dict,
+    source_metadata: dict,
+    template_metadata: dict,
+) -> dict:
+    done = stage_dir / "stage.done"
+    if not done.is_file():
+        raise RuntimeError(f"Missing completed-stage marker {done}.")
+    conflicts = [
+        marker for marker in ("stage.running", "stage.failed")
+        if (stage_dir / marker).exists()
+    ]
+    if conflicts:
+        raise RuntimeError(
+            f"Completed {CO2_PACK_STAGE} has conflicting markers: "
+            f"{', '.join(conflicts)}. Use --co2-repack after inspection."
+        )
+    manifest = _read_json_dict(
+        stage_dir / "stage_manifest.json", "CO2 packing manifest"
+    )
+    if manifest.get("status") != "completed":
+        raise RuntimeError(
+            f"{CO2_PACK_STAGE} stage.done conflicts with manifest status "
+            f"{manifest.get('status')!r}."
+        )
+    recorded_configuration = manifest.get("configuration")
+    if not isinstance(recorded_configuration, dict):
+        raise RuntimeError(f"{CO2_PACK_STAGE} manifest has no configuration.")
+    mismatches = configuration_mismatches(
+        expected_configuration, recorded_configuration
+    )
+    if mismatches:
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: provenance is incompatible "
+            f"(fields: {', '.join(mismatches)}). Use --co2-repack to "
+            "archive and regenerate this packing."
+        )
+    _validate_co2_output_hashes(stage_dir, manifest)
+    if file_sha256(stage_dir / "source_medoid.pdb") != (
+        source_metadata["source_sha256"]
+    ):
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: source_medoid.pdb does not "
+            "match the requested source."
+        )
+    if file_sha256(stage_dir / "co2.pdb") != template_metadata["co2_sha256"]:
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: co2.pdb does not match the "
+            "requested template."
+        )
+    validation = validate_co2_packed_geometry(
+        stage_dir / "source_centered.pdb",
+        stage_dir / "packed_CO2_shell.pdb",
+        source_metadata,
+        template_metadata,
+        expected_configuration["co2_count"],
+        expected_configuration["shell_inner_A"],
+        expected_configuration["shell_outer_A"],
+    )
+    centered_validation = validate_co2_centered_geometry(
+        stage_dir / "packed_CO2_shell.pdb",
+        stage_dir / "system_CO2_centered.pdb",
+        source_metadata,
+        template_metadata,
+        expected_configuration["co2_count"],
+        expected_configuration["shell_inner_A"],
+        expected_configuration["shell_outer_A"],
+    )
+    recorded_wall = manifest.get("wall", {})
+    centered_atoms = _validated_pdb_atoms(
+        stage_dir / "system_CO2_centered.pdb", "centered CO2 system"
+    )
+    maximum_radius = max(
+        math.sqrt(sum(value * value for value in atom["xyz"]))
+        for atom in centered_atoms
+    )
+    wall_radius_A = maximum_radius + expected_configuration["wall_margin_A"]
+    if not math.isclose(
+        recorded_wall.get("radius_A", math.nan),
+        wall_radius_A,
+        abs_tol=PDB_COORDINATE_TOLERANCE_A,
+    ):
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: recorded wall radius is "
+            "incompatible with the centered packed geometry."
+        )
+    if not math.isclose(
+        recorded_wall.get("radius_bohr", math.nan),
+        recorded_wall.get("radius_A", math.nan) * BOHR_PER_ANGSTROM,
+        abs_tol=PDB_COORDINATE_TOLERANCE_A * BOHR_PER_ANGSTROM,
+    ):
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: recorded wall radii in A and "
+            "bohr are inconsistent."
+        )
+    manifest["reuse_validation"] = {
+        "packing": validation,
+        "centering": centered_validation,
+    }
+    return manifest
+
+
+def run_co2_pack_stage(
+    condition_dir: Path,
+    system_name: str,
+    source_pdb: Path,
+    co2_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+    pack_index: int,
+    args,
+) -> dict:
+    stage_dir = condition_dir / CO2_PACK_STAGE
+    seed = co2_pack_seed(args.co2_seed_base, co2_count, pack_index)
+    configuration = co2_pack_configuration(
+        system_name,
+        source_metadata,
+        template_metadata,
+        co2_count,
+        pack_index,
+        seed,
+        args,
+    )
+
+    if (stage_dir / "stage.done").is_file() and not args.co2_repack:
+        manifest = validate_completed_co2_pack(
+            stage_dir, configuration, source_metadata, template_metadata
+        )
+        print(
+            f"  REUSE {system_name}/NCO2_{co2_count:02d}/"
+            f"pack_{pack_index:02d}/{CO2_PACK_STAGE}"
+        )
+        return manifest
+    active_entries = _co2_stage_active_entries(stage_dir)
+    if active_entries and not args.co2_repack:
+        names = ", ".join(path.name for path in active_entries[:6])
+        raise RuntimeError(
+            f"Existing incomplete or failed {CO2_PACK_STAGE} attempt in "
+            f"{stage_dir} ({names}). Inspect it and use --co2-repack to "
+            "archive it before a new packing."
+        )
+
+    packmol_exe = shutil.which(args.packmol)
+    if packmol_exe is None:
+        raise RuntimeError(
+            f"Packmol executable '{args.packmol}' not found in PATH. "
+            "Use --packmol /path/to/packmol if needed."
+        )
+
+    if active_entries:
+        archive = archive_co2_stage_attempt(
+            stage_dir, "Replaced explicitly with --co2-repack."
+        )
+        print(f"  ARCHIVE prior {CO2_PACK_STAGE} attempt at {archive}")
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    source_local = stage_dir / "source_medoid.pdb"
+    source_centered = stage_dir / "source_centered.pdb"
+    co2_local = stage_dir / "co2.pdb"
+    packed_pdb = stage_dir / "packed_CO2_shell.pdb"
+    final_centered = stage_dir / "system_CO2_centered.pdb"
+    input_path = stage_dir / "06_CO2_shell_pack.inp"
+    log_path = stage_dir / "06_CO2_shell_pack.out"
+
+    shutil.copy2(source_pdb, source_local)
+    shutil.copy2(co2_pdb, co2_local)
+    source_centering = center_pdb(source_local, source_centered)
+    centered_source_atoms = _validated_pdb_atoms(
+        source_centered, "centered CO2 source"
+    )
+    zinc_xyz = centered_source_atoms[source_metadata["zinc_index"] - 1]["xyz"]
+    input_path.write_text(co2_packmol_input(
+        args.packmol_tolerance,
+        seed,
+        co2_count,
+        template_metadata["carbon_local_index"],
+        zinc_xyz,
+        args.co2_shell_inner,
+        args.co2_shell_outer,
+    ))
+    command = [args.packmol]
+    started_at = datetime.now(timezone.utc).isoformat()
+    runtime = {
+        "workflow": "CO2_shell_screening",
+        "stage": CO2_PACK_STAGE,
+        "status": "running",
+        "started_at": started_at,
+        "hostname": socket.gethostname(),
+        "command": command,
+        "configuration": configuration,
+    }
+    mark_stage_running(stage_dir, runtime)
+    print(
+        f"  PACK {system_name}/NCO2_{co2_count:02d}/pack_{pack_index:02d} "
+        f"(seed {seed})"
+    )
+
+    returncode = None
+    try:
+        with input_path.open("r") as packmol_input_handle, log_path.open("w") as log:
+            result = subprocess.run(
+                [packmol_exe],
+                cwd=stage_dir,
+                stdin=packmol_input_handle,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        returncode = result.returncode
+        if returncode != 0:
+            raise RuntimeError(f"Packmol returned code {returncode}.")
+        if not packed_pdb.is_file():
+            raise RuntimeError("Packmol did not create packed_CO2_shell.pdb.")
+        if "Success!" not in log_path.read_text(errors="replace"):
+            print(
+                f"  WARNING: {log_path} does not contain Packmol's usual "
+                "'Success!' marker; geometric validation will decide reuse."
+            )
+
+        packing_validation = validate_co2_packed_geometry(
+            source_centered,
+            packed_pdb,
+            source_metadata,
+            template_metadata,
+            co2_count,
+            args.co2_shell_inner,
+            args.co2_shell_outer,
+        )
+        final_centering = center_pdb(packed_pdb, final_centered)
+        centered_validation = validate_co2_centered_geometry(
+            packed_pdb,
+            final_centered,
+            source_metadata,
+            template_metadata,
+            co2_count,
+            args.co2_shell_inner,
+            args.co2_shell_outer,
+        )
+        wall_radius_A = final_centering["max_radius_from_COM_A"] + args.wall_margin
+        wall_radius_bohr = wall_radius_A * BOHR_PER_ANGSTROM
+        final_atoms = _validated_pdb_atoms(final_centered, "centered CO2 system")
+        zinc_after_centering = final_atoms[
+            source_metadata["zinc_index"] - 1
+        ]["xyz"]
+        finished_at = datetime.now(timezone.utc).isoformat()
+        output_names = [
+            source_local.name,
+            source_centered.name,
+            co2_local.name,
+            input_path.name,
+            log_path.name,
+            packed_pdb.name,
+            final_centered.name,
+        ]
+        manifest = {
+            **runtime,
+            "status": "completed",
+            "finished_at": finished_at,
+            "returncode": returncode,
+            "source": source_metadata,
+            "co2_template": template_metadata,
+            "source_centering": source_centering,
+            "zinc_center_in_packmol_frame_A": list(zinc_xyz),
+            "zinc_coordinate_after_final_centering_A": list(
+                zinc_after_centering
+            ),
+            "packing_validation": packing_validation,
+            "final_centering": final_centering,
+            "centered_validation": centered_validation,
+            "wall": {
+                "margin_A": args.wall_margin,
+                "radius_A": wall_radius_A,
+                "radius_bohr": wall_radius_bohr,
+                "center_A": [0.0, 0.0, 0.0],
+            },
+            "composition": {
+                "n_solute_atoms": source_metadata["n_solute_atoms"],
+                "n_waters": source_metadata["n_waters"],
+                "n_co2": co2_count,
+                "n_total_atoms": source_metadata["n_source_atoms"] + 3 * co2_count,
+            },
+            "paths": {
+                "source_pdb": source_local.name,
+                "source_centered_pdb": source_centered.name,
+                "co2_template_pdb": co2_local.name,
+                "packmol_input": input_path.name,
+                "packmol_log": log_path.name,
+                "packed_pdb": packed_pdb.name,
+                "centered_pdb": final_centered.name,
+            },
+            "composition_changed": True,
+            "velocities_preserved": False,
+            "restart_chain_continued": False,
+            "mdrestart_used": False,
+            "source_structure_type": "full-droplet representative frame",
+            "scientific_note": CO2_WORKFLOW_NOTE,
+            "output_sha256": {
+                name: file_sha256(stage_dir / name) for name in output_names
+            },
+        }
+        _write_json(stage_dir / "stage_manifest.json", manifest)
+        mark_stage_done(stage_dir)
+        print(f"  OK   {stage_dir}")
+        return manifest
+    except (OSError, RuntimeError, ValueError) as exc:
+        failure = {
+            **runtime,
+            "status": "failed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": returncode,
+            "failure_reason": str(exc),
+            "source": source_metadata,
+            "co2_template": template_metadata,
+            "composition_changed": True,
+            "velocities_preserved": False,
+            "restart_chain_continued": False,
+            "mdrestart_used": False,
+            "source_structure_type": "full-droplet representative frame",
+            "scientific_note": CO2_WORKFLOW_NOTE,
+        }
+        _write_json(stage_dir / "stage_manifest.json", failure)
+        mark_stage_failed(stage_dir, str(exc))
+        raise RuntimeError(
+            f"{CO2_PACK_STAGE} failed in {stage_dir}: {exc} See "
+            f"{log_path}. Consider reducing --co2-counts or widening "
+            "--co2-shell-inner/--co2-shell-outer; the workflow will not "
+            "remove water or relax the packing constraints silently."
+        ) from exc
+
+
+def validate_co2_accommodated_geometry(
+    initial_pdb: Path,
+    accommodated_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    co2_count: int,
+    fixed_tolerance_A: float = 1.0e-3,
+) -> dict:
+    initial_atoms = _validated_pdb_atoms(initial_pdb, "CO2 accommodation input")
+    final_atoms = _validated_pdb_atoms(
+        accommodated_pdb, "CO2 accommodation output"
+    )
+    expected_atoms = source_metadata["n_source_atoms"] + 3 * co2_count
+    if len(initial_atoms) != expected_atoms or len(final_atoms) != expected_atoms:
+        raise RuntimeError(
+            "CO2 accommodation geometry has an invalid atom count: "
+            f"input {len(initial_atoms)}, output {len(final_atoms)}, "
+            f"expected {expected_atoms}."
+        )
+    if _element_sequence(initial_atoms) != _element_sequence(final_atoms):
+        raise RuntimeError(
+            "CO2 accommodation changed the input element sequence."
+        )
+    displacement = solute_displacement(
+        initial_pdb, accommodated_pdb, source_metadata["n_solute_atoms"]
+    )
+    if displacement["solute_max_displacement_A"] > fixed_tolerance_A:
+        raise RuntimeError(
+            "CO2 accommodation changed fixed solute coordinates by "
+            f"{displacement['solute_max_displacement_A']:.6f} A "
+            f"(allowed {fixed_tolerance_A:.6f} A)."
+        )
+    return {
+        "atom_count_valid": True,
+        "element_order_valid": True,
+        "fixed_solute_valid": True,
+        "fixed_solute_tolerance_A": fixed_tolerance_A,
+        **displacement,
+        "metrics_before": co2_geometry_metrics(
+            initial_pdb, source_metadata, template_metadata, co2_count
+        ),
+        "metrics_after": co2_geometry_metrics(
+            accommodated_pdb, source_metadata, template_metadata, co2_count
+        ),
+    }
+
+
+def co2_accommodation_configuration(
+    packing_manifest_path: Path,
+    packing_manifest: dict,
+    args,
+) -> dict:
+    packing_configuration = packing_manifest["configuration"]
+    return {
+        "stage": CO2_ACCOMMODATION_STAGE,
+        "system": packing_configuration["system"],
+        "n_CO2": packing_configuration["co2_count"],
+        "pack_index": packing_configuration["pack_index"],
+        "input_geometry_sha256": file_sha256(
+            packing_manifest_path.parent / "system_CO2_centered.pdb"
+        ),
+        "packing_manifest_sha256": file_sha256(packing_manifest_path),
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "threads": args.threads,
+        "optimization_level": args.co2_accommodation_level,
+        "optimization_engine": args.co2_accommodation_engine,
+        "max_cycles": args.co2_accommodation_cycles,
+        "wall_radius_A": packing_manifest["wall"]["radius_A"],
+        "wall_radius_bohr": packing_manifest["wall"]["radius_bohr"],
+        "fixed_atoms": f"1-{packing_manifest['source']['n_solute_atoms']}",
+    }
+
+
+def co2_accommodation_command(args) -> list[str]:
+    command = [
+        args.xtb,
+        "system_CO2_centered.pdb",
+        "--gfn", str(args.gfn),
+        "--chrg", str(args.charge),
+        "--uhf", str(args.uhf),
+        "--opt", args.co2_accommodation_level,
+        "--cycles", str(args.co2_accommodation_cycles),
+        "--input", "07_CO2_accommodation.inp",
+    ]
+    if args.alpb:
+        command += ["--alpb", args.alpb]
+    return command
+
+
+def _co2_stage_output_hashes(stage_dir: Path) -> dict:
+    excluded = {
+        "stage.running", "stage.done", "stage.failed", "stage_manifest.json"
+    }
+    return {
+        path.name: file_sha256(path)
+        for path in sorted(stage_dir.iterdir(), key=lambda item: item.name)
+        if path.is_file() and path.name not in excluded
+    }
+
+
+def validate_completed_co2_accommodation(
+    stage_dir: Path,
+    expected_configuration: dict,
+    source_metadata: dict,
+    template_metadata: dict,
+) -> dict:
+    if not (stage_dir / "stage.done").is_file():
+        raise RuntimeError(
+            f"Missing completed-stage marker {stage_dir / 'stage.done'}."
+        )
+    conflicts = [
+        marker for marker in ("stage.running", "stage.failed")
+        if (stage_dir / marker).exists()
+    ]
+    if conflicts:
+        raise RuntimeError(
+            f"Completed {CO2_ACCOMMODATION_STAGE} has conflicting markers: "
+            f"{', '.join(conflicts)}. Use --force after inspection."
+        )
+    manifest = _read_json_dict(
+        stage_dir / "stage_manifest.json", "CO2 accommodation manifest"
+    )
+    if manifest.get("status") != "completed":
+        raise RuntimeError(
+            f"{CO2_ACCOMMODATION_STAGE} stage.done conflicts with manifest "
+            f"status {manifest.get('status')!r}."
+        )
+    recorded_configuration = manifest.get("configuration")
+    if not isinstance(recorded_configuration, dict):
+        raise RuntimeError(
+            f"{CO2_ACCOMMODATION_STAGE} manifest has no configuration."
+        )
+    mismatches = configuration_mismatches(
+        expected_configuration, recorded_configuration
+    )
+    if mismatches:
+        raise RuntimeError(
+            f"Cannot reuse {CO2_ACCOMMODATION_STAGE}: provenance is "
+            f"incompatible (fields: {', '.join(mismatches)}). Use --force "
+            "to archive and rerun this accommodation."
+        )
+    _validate_co2_output_hashes(stage_dir, manifest)
+    if file_sha256(stage_dir / "system_CO2_centered.pdb") != (
+        expected_configuration["input_geometry_sha256"]
+    ):
+        raise RuntimeError(
+            f"Cannot reuse {CO2_ACCOMMODATION_STAGE}: its input copy no "
+            "longer matches the validated packing."
+        )
+    validate_co2_accommodated_geometry(
+        stage_dir / "system_CO2_centered.pdb",
+        stage_dir / "system_CO2_accommodated.pdb",
+        source_metadata,
+        template_metadata,
+        expected_configuration["n_CO2"],
+    )
+    return manifest
+
+
+def run_co2_accommodation_stage(
+    condition_dir: Path,
+    packing_manifest: dict,
+    source_metadata: dict,
+    template_metadata: dict,
+    args,
+) -> dict:
+    pack_stage_dir = condition_dir / CO2_PACK_STAGE
+    packing_manifest_path = pack_stage_dir / "stage_manifest.json"
+    stage_dir = condition_dir / CO2_ACCOMMODATION_STAGE
+    configuration = co2_accommodation_configuration(
+        packing_manifest_path, packing_manifest, args
+    )
+    co2_count = configuration["n_CO2"]
+    pack_index = configuration["pack_index"]
+    system_name = configuration["system"]
+
+    if (stage_dir / "stage.done").is_file() and not args.force:
+        manifest = validate_completed_co2_accommodation(
+            stage_dir, configuration, source_metadata, template_metadata
+        )
+        print(
+            f"  REUSE {system_name}/NCO2_{co2_count:02d}/"
+            f"pack_{pack_index:02d}/{CO2_ACCOMMODATION_STAGE}"
+        )
+        return manifest
+    active_entries = _co2_stage_active_entries(stage_dir)
+    if active_entries and not args.force:
+        names = ", ".join(path.name for path in active_entries[:6])
+        raise RuntimeError(
+            f"Existing incomplete or failed {CO2_ACCOMMODATION_STAGE} "
+            f"attempt in {stage_dir} ({names}). Inspect it and use --force "
+            "to archive it before a new accommodation."
+        )
+
+    xtb_exe = shutil.which(args.xtb)
+    if xtb_exe is None:
+        raise RuntimeError(
+            f"xTB executable '{args.xtb}' not found. Use --xtb "
+            "/path/to/xtb if needed."
+        )
+    if active_entries:
+        archive = archive_co2_stage_attempt(
+            stage_dir, "Replaced explicitly with --force."
+        )
+        print(f"  ARCHIVE prior {CO2_ACCOMMODATION_STAGE} attempt at {archive}")
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    initial_pdb = stage_dir / "system_CO2_centered.pdb"
+    input_path = stage_dir / "07_CO2_accommodation.inp"
+    log_path = stage_dir / "07_CO2_accommodation.out"
+    accommodated_pdb = stage_dir / "system_CO2_accommodated.pdb"
+    shutil.copy2(pack_stage_dir / "system_CO2_centered.pdb", initial_pdb)
+    input_path.write_text(relax_input(
+        source_metadata["n_solute_atoms"],
+        configuration["wall_radius_bohr"],
+        args.co2_accommodation_engine,
+    ))
+    recorded_command = co2_accommodation_command(args)
+    execution_command = [xtb_exe, *recorded_command[1:]]
+    started_at = datetime.now(timezone.utc).isoformat()
+    runtime = {
+        "workflow": "CO2_shell_screening",
+        "stage": CO2_ACCOMMODATION_STAGE,
+        "status": "running",
+        "started_at": started_at,
+        "hostname": socket.gethostname(),
+        "command": recorded_command,
+        "configuration": configuration,
+    }
+    mark_stage_running(stage_dir, runtime)
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(args.threads)
+    env.setdefault("MKL_NUM_THREADS", str(args.threads))
+    env.setdefault("OMP_STACKSIZE", "4G")
+    print(
+        f"  ACCOMMODATE {system_name}/NCO2_{co2_count:02d}/"
+        f"pack_{pack_index:02d}"
+    )
+    print(f"       {' '.join(recorded_command)}")
+
+    returncode = None
+    try:
+        with log_path.open("w") as log:
+            result = subprocess.run(
+                execution_command,
+                cwd=stage_dir,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+            )
+        returncode = result.returncode
+        if returncode != 0:
+            raise RuntimeError(f"xTB returned code {returncode}.")
+        diagnostics = relaxation_diagnostics(
+            log_path, (stage_dir / "NOT_CONVERGED").exists()
+        )
+        materialize_relaxed_pdb(
+            stage_dir,
+            source_metadata["n_source_atoms"] + 3 * co2_count,
+            template_name=initial_pdb.name,
+            destination_name=accommodated_pdb.name,
+            preserve_template_metadata=True,
+        )
+        geometry_validation = validate_co2_accommodated_geometry(
+            initial_pdb,
+            accommodated_pdb,
+            source_metadata,
+            template_metadata,
+            co2_count,
+        )
+        finished_at = datetime.now(timezone.utc).isoformat()
+        manifest = {
+            **runtime,
+            "status": "completed",
+            "finished_at": finished_at,
+            "returncode": returncode,
+            "xtb_version": extract_xtb_version(log_path, accommodated_pdb),
+            "source": source_metadata,
+            "co2_template": template_metadata,
+            "composition": packing_manifest["composition"],
+            "wall": packing_manifest["wall"],
+            "optimization_diagnostics": diagnostics,
+            "geometry_validation": geometry_validation,
+            "composition_changed": True,
+            "velocities_preserved": False,
+            "restart_chain_continued": False,
+            "mdrestart_used": False,
+            "source_structure_type": "full-droplet representative frame",
+            "scientific_note": CO2_WORKFLOW_NOTE,
+            "output_sha256": _co2_stage_output_hashes(stage_dir),
+        }
+        _write_json(stage_dir / "stage_manifest.json", manifest)
+        mark_stage_done(stage_dir)
+        if diagnostics["converged"] is False:
+            print(
+                f"  WARNING {CO2_ACCOMMODATION_STAGE}: formal optimization "
+                "non-convergence reported; final geometry passed workflow "
+                "validation."
+            )
+        elif diagnostics["converged"] is None:
+            print(
+                f"  WARNING {CO2_ACCOMMODATION_STAGE}: convergence status "
+                "could not be determined robustly; final geometry passed "
+                "workflow validation."
+            )
+        print(f"  OK   {stage_dir}")
+        return manifest
+    except (OSError, RuntimeError, ValueError) as exc:
+        failure = {
+            **runtime,
+            "status": "failed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": returncode,
+            "failure_reason": str(exc),
+            "source": source_metadata,
+            "co2_template": template_metadata,
+            "composition_changed": True,
+            "velocities_preserved": False,
+            "restart_chain_continued": False,
+            "mdrestart_used": False,
+            "source_structure_type": "full-droplet representative frame",
+            "scientific_note": CO2_WORKFLOW_NOTE,
+        }
+        _write_json(stage_dir / "stage_manifest.json", failure)
+        mark_stage_failed(stage_dir, str(exc))
+        raise RuntimeError(
+            f"{CO2_ACCOMMODATION_STAGE} failed in {stage_dir}: {exc} "
+            f"Outputs were preserved for diagnosis; see {log_path}."
+        ) from exc
+
+
+PACKING_SUMMARY_FIELDS = [
+    "system", "n_CO2", "pack_index", "seed", "shell_inner_A",
+    "shell_outer_A", "n_atoms", "min_Zn_C_A", "mean_Zn_C_A",
+    "max_Zn_C_A", "min_CO2_source_A", "min_CO2_CO2_A",
+    "packing_status",
+]
+
+ACCOMMODATION_SUMMARY_FIELDS = [
+    "system", "n_CO2", "pack_index", "accommodation_status", "converged",
+    "optimization_cycles", "min_Zn_C_before_A", "min_Zn_C_after_A",
+    "mean_Zn_C_before_A", "mean_Zn_C_after_A",
+    "min_waterO_C_before_A", "min_waterO_C_after_A", "initial_energy",
+    "final_energy",
+]
+
+
+def _summary_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    return value
+
+
+def _co2_effective_stage_status(stage_dir: Path, manifest: dict) -> str:
+    markers = [
+        name for name in ("stage.done", "stage.failed", "stage.running")
+        if (stage_dir / name).exists()
+    ]
+    if len(markers) > 1:
+        return "invalid_conflicting_markers"
+    if markers == ["stage.done"]:
+        return (
+            "completed"
+            if manifest.get("status") == "completed"
+            else "invalid_done_manifest"
+        )
+    if markers == ["stage.failed"]:
+        return "failed"
+    if markers == ["stage.running"]:
+        return "running"
+    return str(manifest.get("status") or "incomplete")
+
+
+def _write_tsv(path: Path, fields: list[str], rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: _summary_value(row.get(field)) for field in fields})
+
+
+def rebuild_co2_summaries(system_dir: Path):
+    packing_rows = []
+    accommodation_rows = []
+    condition_dirs = sorted(
+        system_dir.glob("NCO2_*/pack_*"),
+        key=lambda path: (
+            int(path.parent.name.removeprefix("NCO2_")),
+            int(path.name.removeprefix("pack_")),
+        ),
+    )
+    for condition_dir in condition_dirs:
+        pack_stage_dir = condition_dir / CO2_PACK_STAGE
+        pack_manifest_path = pack_stage_dir / "stage_manifest.json"
+        if pack_manifest_path.is_file():
+            manifest = _read_json_dict(
+                pack_manifest_path, "CO2 packing manifest"
+            )
+            config = manifest.get("configuration", {})
+            validation = manifest.get("packing_validation", {})
+            metrics = validation.get("metrics", {})
+            composition = manifest.get("composition", {})
+            packing_rows.append({
+                "system": config.get("system"),
+                "n_CO2": config.get("co2_count"),
+                "pack_index": config.get("pack_index"),
+                "seed": config.get("packmol_seed"),
+                "shell_inner_A": config.get("shell_inner_A"),
+                "shell_outer_A": config.get("shell_outer_A"),
+                "n_atoms": composition.get("n_total_atoms"),
+                "min_Zn_C_A": metrics.get("zn_c_min_A"),
+                "mean_Zn_C_A": metrics.get("zn_c_mean_A"),
+                "max_Zn_C_A": metrics.get("zn_c_max_A"),
+                "min_CO2_source_A": validation.get(
+                    "minimum_CO2_source_distance_A"
+                ),
+                "min_CO2_CO2_A": validation.get(
+                    "minimum_CO2_CO2_distance_A"
+                ),
+                "packing_status": _co2_effective_stage_status(
+                    pack_stage_dir, manifest
+                ),
+            })
+
+        accommodation_stage_dir = condition_dir / CO2_ACCOMMODATION_STAGE
+        accommodation_manifest_path = accommodation_stage_dir / "stage_manifest.json"
+        if accommodation_manifest_path.is_file():
+            manifest = _read_json_dict(
+                accommodation_manifest_path, "CO2 accommodation manifest"
+            )
+            config = manifest.get("configuration", {})
+            diagnostics = manifest.get("optimization_diagnostics", {})
+            geometry = manifest.get("geometry_validation", {})
+            before = geometry.get("metrics_before", {})
+            after = geometry.get("metrics_after", {})
+            accommodation_rows.append({
+                "system": config.get("system"),
+                "n_CO2": config.get("n_CO2"),
+                "pack_index": config.get("pack_index"),
+                "accommodation_status": _co2_effective_stage_status(
+                    accommodation_stage_dir, manifest
+                ),
+                "converged": diagnostics.get("converged"),
+                "optimization_cycles": diagnostics.get("cycles"),
+                "min_Zn_C_before_A": before.get("zn_c_min_A"),
+                "min_Zn_C_after_A": after.get("zn_c_min_A"),
+                "mean_Zn_C_before_A": before.get("zn_c_mean_A"),
+                "mean_Zn_C_after_A": after.get("zn_c_mean_A"),
+                "min_waterO_C_before_A": before.get("water_o_c_min_A"),
+                "min_waterO_C_after_A": after.get("water_o_c_min_A"),
+                "initial_energy": diagnostics.get("initial_energy_Eh"),
+                "final_energy": diagnostics.get("final_energy_Eh"),
+            })
+
+    _write_tsv(system_dir / "packing_summary.tsv", PACKING_SUMMARY_FIELDS, packing_rows)
+    accommodation_summary = system_dir / "accommodation_summary.tsv"
+    if accommodation_rows or accommodation_summary.exists():
+        _write_tsv(
+            accommodation_summary,
+            ACCOMMODATION_SUMMARY_FIELDS,
+            accommodation_rows,
+        )
+
+
+def find_co2_pdb(explicit: Path | None = None) -> Path:
+    if explicit is not None:
+        if not explicit.is_file():
+            raise RuntimeError(f"CO2 template PDB not found: {explicit}")
+        return explicit.resolve()
+    candidate = ROOT / "co2.pdb"
+    if candidate.is_file():
+        return candidate.resolve()
+    raise RuntimeError(
+        "No CO2 template PDB was supplied. Use --co2-pdb /path/to/co2.pdb "
+        "or create co2.pdb in the repository root."
+    )
+
+
+def run_co2_workflow(args, system_name: str):
+    source_pdb = args.co2_source_pdb.resolve()
+    co2_pdb = find_co2_pdb(args.co2_pdb)
+    expected_solute_pdb = SYSTEMS[system_name]["solute"].resolve()
+    source_metadata = validate_co2_source_pdb(
+        source_pdb, args.co2_solute_atoms, expected_solute_pdb
+    )
+    template_metadata = validate_co2_template(co2_pdb)
+    if shutil.which(args.packmol) is None:
+        raise RuntimeError(
+            f"Packmol executable '{args.packmol}' not found in PATH. "
+            "Use --packmol /path/to/packmol if needed."
+        )
+    if args.run and shutil.which(args.xtb) is None:
+        raise RuntimeError(
+            f"xTB executable '{args.xtb}' not found. Use --xtb "
+            "/path/to/xtb if needed."
+        )
+    system_dir = args.co2_project.resolve() / system_name
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"CO2 shell-screen project: {args.co2_project.resolve()}")
+    print(f"System: {system_name}")
+    print(f"Source full droplet: {source_pdb}")
+    print(f"CO2 template: {co2_pdb}")
+    print(
+        f"Shell around Zn: {args.co2_shell_inner:.3f}-"
+        f"{args.co2_shell_outer:.3f} A"
+    )
+    print(CO2_WORKFLOW_NOTE)
+
+    try:
+        for co2_count in sorted(args.co2_counts):
+            for pack_index in range(1, args.co2_pack_replicas + 1):
+                condition_dir = co2_condition_dir(
+                    args.co2_project.resolve(),
+                    system_name,
+                    co2_count,
+                    pack_index,
+                )
+                packing_manifest = run_co2_pack_stage(
+                    condition_dir,
+                    system_name,
+                    source_pdb,
+                    co2_pdb,
+                    source_metadata,
+                    template_metadata,
+                    co2_count,
+                    pack_index,
+                    args,
+                )
+                rebuild_co2_summaries(system_dir)
+                if args.run:
+                    run_co2_accommodation_stage(
+                        condition_dir,
+                        packing_manifest,
+                        source_metadata,
+                        template_metadata,
+                        args,
+                    )
+                    rebuild_co2_summaries(system_dir)
+    finally:
+        rebuild_co2_summaries(system_dir)
+
+    if not args.run:
+        print(
+            "CO2 shell packing finished and was validated. Inspect "
+            "system_CO2_centered.pdb and packing_summary.tsv before running "
+            "the xTB accommodation with the same command plus --run."
+        )
+    else:
+        print("CO2 shell packing and structural accommodation finished.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -3648,7 +5090,7 @@ def parse_args():
         description=(
             "Prepare spherical Packmol droplets and optionally run "
             "xTB MD E2 thermalization + screening, with an opt-in "
-            "20 ps continuation."
+            "20 ps continuation, or run the independent CO2 shell screen."
         )
     )
 
@@ -3905,6 +5347,101 @@ def parse_args():
         help="Re-run xTB stages even if stage.done exists.",
     )
 
+    co2 = p.add_argument_group(
+        "independent CO2 shell screening",
+        "Build new full-droplet + CO2 conditions and optionally optimize "
+        "mobile water/CO2; this is not an MD continuation.",
+    )
+    co2.add_argument(
+        "--co2-shell-screen",
+        action="store_true",
+        help="Activate the independent 06/07 CO2 shell-screen workflow.",
+    )
+    co2.add_argument(
+        "--co2-source-pdb",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Full representative droplet PDB: Zn(His)2 plus explicit waters.",
+    )
+    co2.add_argument(
+        "--co2-pdb",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Three-atom molecular CO2 template PDB (default: ROOT/co2.pdb).",
+    )
+    co2.add_argument(
+        "--co2-counts",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="N",
+        help="One or more CO2 molecule counts, e.g. 1 2 4 8.",
+    )
+    co2.add_argument(
+        "--co2-shell-inner",
+        type=float,
+        default=4.0,
+        help="Inner Zn-to-CO2-carbon packing radius in A (default: 4.0).",
+    )
+    co2.add_argument(
+        "--co2-shell-outer",
+        type=float,
+        default=6.0,
+        help="Outer Zn-to-CO2-carbon packing radius in A (default: 6.0).",
+    )
+    co2.add_argument(
+        "--co2-pack-replicas",
+        type=int,
+        default=1,
+        help="Independent Packmol placements for each CO2 count (default: 1).",
+    )
+    co2.add_argument(
+        "--co2-project",
+        type=Path,
+        default=ROOT / "co2_screening",
+        help="CO2 workflow output directory (default: ROOT/co2_screening).",
+    )
+    co2.add_argument(
+        "--co2-solute-atoms",
+        type=int,
+        default=39,
+        help="Leading biomimetic atoms fixed during accommodation (default: 39).",
+    )
+    co2.add_argument(
+        "--co2-seed-base",
+        type=int,
+        default=314159,
+        help="Deterministic independent base for CO2 Packmol seeds (default: 314159).",
+    )
+    co2.add_argument(
+        "--co2-repack",
+        action="store_true",
+        help="Archive and regenerate only the CO2 packing stage.",
+    )
+    co2.add_argument(
+        "--co2-accommodation-level",
+        default="loose",
+        choices=[
+            "crude", "sloppy", "loose", "lax", "normal", "tight",
+            "vtight", "extreme",
+        ],
+        help="xTB optimization level for CO2 accommodation (default: loose).",
+    )
+    co2.add_argument(
+        "--co2-accommodation-cycles",
+        type=int,
+        default=30,
+        help="Maximum CO2 accommodation optimization cycles (default: 30).",
+    )
+    co2.add_argument(
+        "--co2-accommodation-engine",
+        default="auto",
+        choices=["auto", "rf", "lbfgs", "inertial"],
+        help="CO2 accommodation optimizer; inertial selects xTB FIRE (default: auto).",
+    )
+
     return p.parse_args()
 
 
@@ -3960,6 +5497,95 @@ def validate_args(args):
     if args.relax_cycles < 1:
         raise SystemExit("--relax-cycles must be >= 1.")
 
+    if args.co2_shell_screen:
+        if args.system is None or len(args.system) != 1:
+            raise SystemExit(
+                "--co2-shell-screen requires exactly one system selected "
+                "with --system NAME."
+            )
+        if args.co2_source_pdb is None:
+            raise SystemExit(
+                "--co2-shell-screen requires --co2-source-pdb FILE."
+            )
+        if not args.co2_source_pdb.is_file():
+            raise SystemExit(
+                f"CO2 source PDB not found: {args.co2_source_pdb}"
+            )
+        if args.co2_counts is None:
+            raise SystemExit(
+                "--co2-shell-screen requires --co2-counts N [N ...]."
+            )
+        if any(count < 1 for count in args.co2_counts):
+            raise SystemExit("Every --co2-counts value must be >= 1.")
+        if len(set(args.co2_counts)) != len(args.co2_counts):
+            raise SystemExit("--co2-counts must not contain duplicates.")
+        if args.co2_shell_inner <= 0:
+            raise SystemExit("--co2-shell-inner must be > 0.")
+        if args.co2_shell_outer <= args.co2_shell_inner:
+            raise SystemExit(
+                "--co2-shell-outer must be greater than --co2-shell-inner."
+            )
+        if args.co2_pack_replicas < 1:
+            raise SystemExit("--co2-pack-replicas must be >= 1.")
+        if args.co2_solute_atoms < 1:
+            raise SystemExit("--co2-solute-atoms must be >= 1.")
+        if args.co2_seed_base < 1:
+            raise SystemExit("--co2-seed-base must be >= 1.")
+        seeds = [
+            co2_pack_seed(args.co2_seed_base, count, pack_index)
+            for count in args.co2_counts
+            for pack_index in range(1, args.co2_pack_replicas + 1)
+        ]
+        if len(seeds) != len(set(seeds)):
+            raise SystemExit(
+                "The requested CO2 count/packing combinations produce a "
+                "Packmol seed collision; reduce the extreme count/replica "
+                "range."
+            )
+        if args.co2_accommodation_cycles < 1:
+            raise SystemExit("--co2-accommodation-cycles must be >= 1.")
+        if args.force and not args.run:
+            raise SystemExit(
+                "In CO2 mode, --force reruns 07_CO2_accommodation and "
+                "therefore requires --run. Use --co2-repack for stage 06."
+            )
+        incompatible = []
+        if args.resume:
+            incompatible.append("--resume")
+        if args.start_stage is not None:
+            incompatible.append("--start-stage")
+        if args.dry_run:
+            incompatible.append("--dry-run")
+        if args.repack:
+            incompatible.append("--repack")
+        if incompatible:
+            raise SystemExit(
+                "--co2-shell-screen cannot be combined with "
+                + ", ".join(incompatible)
+                + "."
+            )
+        return
+
+    if (
+        args.co2_repack
+        or args.co2_source_pdb is not None
+        or args.co2_pdb is not None
+        or args.co2_counts
+        or args.co2_shell_inner != 4.0
+        or args.co2_shell_outer != 6.0
+        or args.co2_pack_replicas != 1
+        or args.co2_project != ROOT / "co2_screening"
+        or args.co2_solute_atoms != 39
+        or args.co2_seed_base != 314159
+        or args.co2_accommodation_level != "loose"
+        or args.co2_accommodation_cycles != 30
+        or args.co2_accommodation_engine != "auto"
+    ):
+        raise SystemExit(
+            "CO2-specific source/count/repack options require "
+            "--co2-shell-screen."
+        )
+
     if args.run and args.dry_run:
         raise SystemExit("--run cannot be combined with --dry-run.")
 
@@ -4007,6 +5633,13 @@ def main():
     validate_args(args)
 
     selected = select_systems(args)
+    if args.co2_shell_screen:
+        try:
+            run_co2_workflow(args, selected[0])
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        return
+
     existing_only = args.resume or args.start_stage is not None
 
     if args.run and shutil.which(args.xtb) is None:
