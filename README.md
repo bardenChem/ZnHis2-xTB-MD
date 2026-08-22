@@ -241,6 +241,39 @@ at its already centered coordinates. This follows the documented classic
 The three-atom CO2 template is treated as rigid by Packmol and must contain one
 C, two O, nonzero C--O distances, and an O--C--O angle of at least 170 degrees.
 
+The historical `random-shell` placement remains the default. To deliberately
+place one CO2 near a user-selected side of the open site, use the optional
+`site-directed` mode and give the 1-based ordinal atom index in the source PDB:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system T4_IV_Hudecova \
+    --co2-shell-screen \
+    --co2-source-pdb T4_IV_open_medoid_full.pdb \
+    --co2-pdb co2.pdb \
+    --co2-counts 1 \
+    --co2-placement-mode site-directed \
+    --co2-direction-atom 500 \
+    --co2-shell-inner 4.0 \
+    --co2-shell-outer 7.0 \
+    --co2-target-distance 5.5 \
+    --co2-target-radius 1.5 \
+    --co2-project co2_site_directed_open
+```
+
+Here `500` is only an example and is not hardcoded. The direction is computed
+from Zn toward that atom after the source has been centered. The targeted
+carbon must remain in the Zn shell and within the requested sphere around the
+directional target point. With `--co2-counts 4`, molecule 1 is site-directed
+and molecules 2--4 are packed independently in the ordinary Zn shell. The
+directional condition is validated again after final centering and recorded in
+the manifest and `packing_summary.tsv`.
+
+This is only an initial-condition generator. The target sphere is absent from
+07--10: during accommodation water and CO2 remain mobile, and during MD all
+atoms remain free. It must not be interpreted as spontaneous access from bulk,
+binding, docking, a reaction coordinate, or a free-energy calculation.
+
 After inspecting every `system_CO2_centered.pdb`, repeat the same command with
 the desired xTB allocation and `--run`:
 

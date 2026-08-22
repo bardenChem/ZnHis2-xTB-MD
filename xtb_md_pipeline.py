@@ -189,6 +189,14 @@ CO2_WORKFLOW_NOTE = (
     "equilibrated aqueous configuration. It is not a dynamical continuation "
     "of stage 05."
 )
+CO2_SITE_DIRECTED_NOTE = (
+    "This condition uses a site-directed initial placement of one CO2 "
+    "molecule. The directional restriction is applied only during Packmol "
+    "generation and does not persist during xTB accommodation or MD. "
+    "Therefore this trajectory tests the evolution of a deliberately "
+    "site-proximal initial condition and must not be interpreted as "
+    "spontaneous CO2 access from bulk."
+)
 PDB_COORDINATE_TOLERANCE_A = 0.002
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
 
@@ -3975,6 +3983,96 @@ def co2_pack_seed(seed_base: int, co2_count: int, pack_index: int) -> int:
     return ((seed_base - 1 + pairing) % 2_147_483_646) + 1
 
 
+def co2_effective_target_distance(
+    shell_inner_A: float,
+    shell_outer_A: float,
+    requested_distance_A: float | None,
+) -> float:
+    if requested_distance_A is None:
+        return (shell_inner_A + shell_outer_A) / 2.0
+    return requested_distance_A
+
+
+def co2_site_direction_metadata(
+    centered_pdb: Path,
+    source_metadata: dict,
+    direction_atom_index: int,
+    target_distance_A: float,
+    target_radius_A: float,
+) -> dict:
+    """Derive a site direction from 1-based atom order in centered geometry."""
+    atoms = _validated_pdb_atoms(centered_pdb, "site-direction geometry")
+    n_source_atoms = source_metadata["n_source_atoms"]
+    if len(atoms) < n_source_atoms:
+        raise RuntimeError(
+            f"Site-direction geometry {centered_pdb} has {len(atoms)} atoms; "
+            f"the source requires at least {n_source_atoms}."
+        )
+    if _element_sequence(atoms[:n_source_atoms]) != (
+        source_metadata["element_sequence"]
+    ):
+        raise RuntimeError(
+            "Site-direction geometry does not preserve the source atom order."
+        )
+    if direction_atom_index < 1:
+        raise RuntimeError("CO2 direction atom index must be >= 1.")
+    if direction_atom_index > n_source_atoms:
+        raise RuntimeError(
+            f"CO2 direction atom index {direction_atom_index} is outside "
+            f"the source atom range 1-{n_source_atoms}."
+        )
+    zinc_index = source_metadata["zinc_index"]
+    if direction_atom_index == zinc_index:
+        raise RuntimeError(
+            f"CO2 direction atom {direction_atom_index} is the Zn atom."
+        )
+    if not math.isfinite(target_distance_A) or target_distance_A <= 0.0:
+        raise RuntimeError("CO2 target distance must be finite and > 0 A.")
+    if not math.isfinite(target_radius_A) or target_radius_A <= 0.0:
+        raise RuntimeError("CO2 target radius must be finite and > 0 A.")
+
+    zinc_xyz = atoms[zinc_index - 1]["xyz"]
+    direction_atom = atoms[direction_atom_index - 1]
+    reference_xyz = direction_atom["xyz"]
+    vector = tuple(
+        reference - zinc
+        for reference, zinc in zip(reference_xyz, zinc_xyz)
+    )
+    distance = math.sqrt(sum(value * value for value in vector))
+    if distance <= 1.0e-6:
+        raise RuntimeError(
+            "CO2 direction atom is coincident with Zn within 1e-6 A."
+        )
+    unit_vector = tuple(value / distance for value in vector)
+    target_xyz = tuple(
+        zinc + target_distance_A * direction
+        for zinc, direction in zip(zinc_xyz, unit_vector)
+    )
+    return {
+        "zinc_index": zinc_index,
+        "direction_atom_index": direction_atom_index,
+        "direction_atom_element": direction_atom["element"],
+        "zinc_xyz_A": list(zinc_xyz),
+        "direction_atom_xyz_A": list(reference_xyz),
+        "zn_direction_atom_distance_A": distance,
+        "unit_vector": list(unit_vector),
+        "target_xyz_A": list(target_xyz),
+        "target_distance_A": target_distance_A,
+        "target_radius_A": target_radius_A,
+    }
+
+
+def co2_targeted_carbon_global_atom_index(
+    source_metadata: dict,
+    template_metadata: dict,
+) -> int:
+    """Return the 1-based carbon index of targeted CO2 molecule 1."""
+    return (
+        source_metadata["n_source_atoms"]
+        + template_metadata["carbon_local_index"]
+    )
+
+
 def co2_packmol_input(
     tolerance_A: float,
     seed: int,
@@ -3983,9 +4081,12 @@ def co2_packmol_input(
     zinc_xyz,
     shell_inner_A: float,
     shell_outer_A: float,
+    *,
+    placement_mode: str = "random-shell",
+    site_direction: dict | None = None,
 ) -> str:
     zinc_x, zinc_y, zinc_z = zinc_xyz
-    return f"""tolerance {tolerance_A:.6f}
+    header = f"""tolerance {tolerance_A:.6f}
 filetype pdb
 output packed_CO2_shell.pdb
 seed {seed}
@@ -3994,15 +4095,44 @@ structure source_centered.pdb
   number 1
   fixed 0. 0. 0. 0. 0. 0.
 end structure
-
+"""
+    shell_constraints = f"""    outside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_inner_A:.6f}
+    inside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_outer_A:.6f}"""
+    if placement_mode == "random-shell":
+        return header + f"""
 structure co2.pdb
   number {co2_count}
   atoms {carbon_local_index}
-    outside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_inner_A:.6f}
-    inside sphere {zinc_x:.6f} {zinc_y:.6f} {zinc_z:.6f} {shell_outer_A:.6f}
+{shell_constraints}
   end atoms
 end structure
 """
+    if placement_mode != "site-directed":
+        raise ValueError(f"Unsupported CO2 placement mode: {placement_mode}.")
+    if site_direction is None:
+        raise ValueError("site-directed Packmol input requires site metadata.")
+    target_x, target_y, target_z = site_direction["target_xyz_A"]
+    target_radius_A = site_direction["target_radius_A"]
+    targeted_block = f"""
+structure co2.pdb
+  number 1
+  atoms {carbon_local_index}
+{shell_constraints}
+    inside sphere {target_x:.6f} {target_y:.6f} {target_z:.6f} {target_radius_A:.6f}
+  end atoms
+end structure
+"""
+    if co2_count == 1:
+        return header + targeted_block
+    background_block = f"""
+structure co2.pdb
+  number {co2_count - 1}
+  atoms {carbon_local_index}
+{shell_constraints}
+  end atoms
+end structure
+"""
+    return header + targeted_block + background_block
 
 
 def _co2_carbon_indices(
@@ -4074,6 +4204,57 @@ def co2_geometry_metrics(
     }
 
 
+def validate_co2_site_direction_geometry(
+    pdb_path: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    site_direction: dict,
+    coordinate_tolerance_A: float,
+) -> dict:
+    """Recompute and validate targeted-CO2 geometry in the current frame."""
+    current_direction = co2_site_direction_metadata(
+        pdb_path,
+        source_metadata,
+        site_direction["direction_atom_index"],
+        site_direction["target_distance_A"],
+        site_direction["target_radius_A"],
+    )
+    atoms = _validated_pdb_atoms(pdb_path, "site-directed CO2 geometry")
+    carbon_atom_index = co2_targeted_carbon_global_atom_index(
+        source_metadata, template_metadata
+    )
+    carbon_xyz = atoms[carbon_atom_index - 1]["xyz"]
+    zinc_xyz = atoms[current_direction["zinc_index"] - 1]["xyz"]
+    direction_xyz = atoms[
+        current_direction["direction_atom_index"] - 1
+    ]["xyz"]
+    zinc_carbon_distance = math.dist(zinc_xyz, carbon_xyz)
+    target_point_distance = math.dist(
+        carbon_xyz, current_direction["target_xyz_A"]
+    )
+    if (
+        target_point_distance
+        > current_direction["target_radius_A"] + coordinate_tolerance_A
+    ):
+        raise RuntimeError(
+            "Targeted CO2 carbon is outside the site-directed target "
+            f"sphere: C-target = {target_point_distance:.6f} A, radius = "
+            f"{current_direction['target_radius_A']:.6f} A, tolerance = "
+            f"{coordinate_tolerance_A:.6f} A."
+        )
+    angle = _angle_degrees(direction_xyz, zinc_xyz, carbon_xyz)
+    return {
+        "targeted_CO2_index": 1,
+        "targeted_carbon_atom_index": carbon_atom_index,
+        "targeted_Zn_C_distance_A": zinc_carbon_distance,
+        "targeted_target_point_distance_A": target_point_distance,
+        "target_radius_A": current_direction["target_radius_A"],
+        "targeted_direction_angle_degrees": angle,
+        "site_direction_valid": True,
+        "recomputed_site_direction": current_direction,
+    }
+
+
 def validate_co2_packed_geometry(
     source_centered_pdb: Path,
     packed_pdb: Path,
@@ -4083,6 +4264,7 @@ def validate_co2_packed_geometry(
     shell_inner_A: float,
     shell_outer_A: float,
     coordinate_tolerance_A: float = PDB_COORDINATE_TOLERANCE_A,
+    site_direction: dict | None = None,
 ) -> dict:
     source_atoms = _validated_pdb_atoms(source_centered_pdb, "centered source")
     packed_atoms = _validated_pdb_atoms(packed_pdb, "Packmol CO2 output")
@@ -4160,7 +4342,7 @@ def validate_co2_packed_geometry(
             for second_atom in range(3)
         )
 
-    return {
+    validation = {
         "atom_count_valid": True,
         "element_order_valid": True,
         "source_coordinates_preserved": True,
@@ -4171,6 +4353,15 @@ def validate_co2_packed_geometry(
         "minimum_CO2_CO2_distance_A": min_co2_co2,
         "metrics": metrics,
     }
+    if site_direction is not None:
+        validation.update(validate_co2_site_direction_geometry(
+            packed_pdb,
+            source_metadata,
+            template_metadata,
+            site_direction,
+            coordinate_tolerance_A,
+        ))
+    return validation
 
 
 def validate_co2_centered_geometry(
@@ -4181,6 +4372,7 @@ def validate_co2_centered_geometry(
     co2_count: int,
     shell_inner_A: float | None = None,
     shell_outer_A: float | None = None,
+    site_direction: dict | None = None,
 ) -> dict:
     packed_atoms = _validated_pdb_atoms(packed_pdb, "packed CO2 geometry")
     centered_atoms = _validated_pdb_atoms(centered_pdb, "centered CO2 geometry")
@@ -4221,12 +4413,21 @@ def validate_co2_centered_geometry(
                     for index, distance in outside
                 )
             )
-    return {
+    validation = {
         "element_order_valid": True,
         "maximum_zn_c_distance_change_A": maximum_change,
         "shell_revalidated": shell_inner_A is not None,
         "metrics": after,
     }
+    if site_direction is not None:
+        validation.update(validate_co2_site_direction_geometry(
+            centered_pdb,
+            source_metadata,
+            template_metadata,
+            site_direction,
+            2 * PDB_COORDINATE_TOLERANCE_A,
+        ))
+    return validation
 
 
 def _read_json_dict(path: Path, description: str) -> dict:
@@ -4313,7 +4514,8 @@ def co2_pack_configuration(
     seed: int,
     args,
 ) -> dict:
-    return {
+    placement_mode = getattr(args, "co2_placement_mode", "random-shell")
+    configuration = {
         "stage": CO2_PACK_STAGE,
         "system": system_name,
         "source_sha256": source_metadata["source_sha256"],
@@ -4329,7 +4531,81 @@ def co2_pack_configuration(
         "shell_inner_A": args.co2_shell_inner,
         "shell_outer_A": args.co2_shell_outer,
         "wall_margin_A": args.wall_margin,
+        "placement_mode": placement_mode,
     }
+    if placement_mode == "site-directed":
+        direction_atom_index = getattr(args, "co2_direction_atom", None)
+        if direction_atom_index is None:
+            raise RuntimeError(
+                "site-directed CO2 placement requires --co2-direction-atom."
+            )
+        if direction_atom_index < 1:
+            raise RuntimeError("CO2 direction atom index must be >= 1.")
+        if direction_atom_index > source_metadata["n_source_atoms"]:
+            raise RuntimeError(
+                f"CO2 direction atom index {direction_atom_index} is "
+                "outside the source atom range 1-"
+                f"{source_metadata['n_source_atoms']}."
+            )
+        if direction_atom_index == source_metadata["zinc_index"]:
+            raise RuntimeError(
+                f"CO2 direction atom {direction_atom_index} is the Zn atom."
+            )
+        target_distance_A = co2_effective_target_distance(
+            args.co2_shell_inner,
+            args.co2_shell_outer,
+            getattr(args, "co2_target_distance", None),
+        )
+        target_radius_A = getattr(args, "co2_target_radius", 1.5)
+        if (
+            not math.isfinite(target_distance_A)
+            or not (
+                args.co2_shell_inner
+                <= target_distance_A
+                <= args.co2_shell_outer
+            )
+        ):
+            raise RuntimeError(
+                "CO2 target distance must be finite and inside the Zn shell."
+            )
+        if not math.isfinite(target_radius_A) or target_radius_A <= 0.0:
+            raise RuntimeError("CO2 target radius must be finite and > 0 A.")
+        configuration.update({
+            "direction_atom_index": direction_atom_index,
+            "direction_atom_element": source_metadata[
+                "element_sequence"
+            ][direction_atom_index - 1],
+            "zinc_index": source_metadata["zinc_index"],
+            "target_distance_A": target_distance_A,
+            "target_radius_A": target_radius_A,
+        })
+    return configuration
+
+
+def co2_site_direction_from_configuration(
+    centered_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    configuration: dict,
+) -> dict | None:
+    if configuration.get("placement_mode") != "site-directed":
+        return None
+    metadata = co2_site_direction_metadata(
+        centered_pdb,
+        source_metadata,
+        configuration["direction_atom_index"],
+        configuration["target_distance_A"],
+        configuration["target_radius_A"],
+    )
+    metadata.update({
+        "targeted_CO2_index": 1,
+        "targeted_carbon_global_atom_index": (
+            co2_targeted_carbon_global_atom_index(
+                source_metadata, template_metadata
+            )
+        ),
+    })
+    return metadata
 
 
 def validate_completed_co2_pack(
@@ -4361,8 +4637,16 @@ def validate_completed_co2_pack(
     recorded_configuration = manifest.get("configuration")
     if not isinstance(recorded_configuration, dict):
         raise RuntimeError(f"{CO2_PACK_STAGE} manifest has no configuration.")
+    comparison_configuration = dict(recorded_configuration)
+    if (
+        expected_configuration["placement_mode"] == "random-shell"
+        and "placement_mode" not in comparison_configuration
+    ):
+        # Packing manifests predating the placement option can only have
+        # been generated by the historical random-shell implementation.
+        comparison_configuration["placement_mode"] = "random-shell"
     mismatches = configuration_mismatches(
-        expected_configuration, recorded_configuration
+        expected_configuration, comparison_configuration
     )
     if mismatches:
         raise RuntimeError(
@@ -4383,6 +4667,49 @@ def validate_completed_co2_pack(
             f"Cannot reuse {CO2_PACK_STAGE}: co2.pdb does not match the "
             "requested template."
         )
+    site_direction = co2_site_direction_from_configuration(
+        stage_dir / "source_centered.pdb",
+        source_metadata,
+        template_metadata,
+        expected_configuration,
+    )
+    if site_direction is not None:
+        if manifest.get("site_direction") != site_direction:
+            raise RuntimeError(
+                f"Cannot reuse {CO2_PACK_STAGE}: recorded site_direction "
+                "metadata differs from the centered source geometry."
+            )
+        if manifest.get("site_directed_scientific_note") != (
+            CO2_SITE_DIRECTED_NOTE
+        ):
+            raise RuntimeError(
+                f"Cannot reuse {CO2_PACK_STAGE}: missing or incompatible "
+                "site-directed scientific note."
+            )
+    centered_source_atoms = _validated_pdb_atoms(
+        stage_dir / "source_centered.pdb", "centered CO2 source"
+    )
+    zinc_xyz = centered_source_atoms[
+        source_metadata["zinc_index"] - 1
+    ]["xyz"]
+    expected_packmol_input = co2_packmol_input(
+        expected_configuration["packmol_tolerance_A"],
+        expected_configuration["packmol_seed"],
+        expected_configuration["co2_count"],
+        expected_configuration["co2_carbon_local_index"],
+        zinc_xyz,
+        expected_configuration["shell_inner_A"],
+        expected_configuration["shell_outer_A"],
+        placement_mode=expected_configuration["placement_mode"],
+        site_direction=site_direction,
+    )
+    if (stage_dir / "06_CO2_shell_pack.inp").read_text() != (
+        expected_packmol_input
+    ):
+        raise RuntimeError(
+            f"Cannot reuse {CO2_PACK_STAGE}: archived Packmol input is "
+            "incompatible with the requested placement."
+        )
     validation = validate_co2_packed_geometry(
         stage_dir / "source_centered.pdb",
         stage_dir / "packed_CO2_shell.pdb",
@@ -4391,6 +4718,7 @@ def validate_completed_co2_pack(
         expected_configuration["co2_count"],
         expected_configuration["shell_inner_A"],
         expected_configuration["shell_outer_A"],
+        site_direction=site_direction,
     )
     centered_validation = validate_co2_centered_geometry(
         stage_dir / "packed_CO2_shell.pdb",
@@ -4400,7 +4728,24 @@ def validate_completed_co2_pack(
         expected_configuration["co2_count"],
         expected_configuration["shell_inner_A"],
         expected_configuration["shell_outer_A"],
+        site_direction=site_direction,
     )
+    if site_direction is not None:
+        recorded_validation = manifest.get("packing_validation", {})
+        for field in (
+            "targeted_CO2_index",
+            "targeted_carbon_atom_index",
+            "targeted_Zn_C_distance_A",
+            "targeted_target_point_distance_A",
+            "target_radius_A",
+            "targeted_direction_angle_degrees",
+            "site_direction_valid",
+        ):
+            if recorded_validation.get(field) != validation.get(field):
+                raise RuntimeError(
+                    f"Cannot reuse {CO2_PACK_STAGE}: recorded site-directed "
+                    f"validation field {field} is inconsistent."
+                )
     recorded_wall = manifest.get("wall", {})
     centered_atoms = _validated_pdb_atoms(
         stage_dir / "system_CO2_centered.pdb", "centered CO2 system"
@@ -4504,6 +4849,12 @@ def run_co2_pack_stage(
         source_centered, "centered CO2 source"
     )
     zinc_xyz = centered_source_atoms[source_metadata["zinc_index"] - 1]["xyz"]
+    site_direction = co2_site_direction_from_configuration(
+        source_centered,
+        source_metadata,
+        template_metadata,
+        configuration,
+    )
     input_path.write_text(co2_packmol_input(
         args.packmol_tolerance,
         seed,
@@ -4512,6 +4863,8 @@ def run_co2_pack_stage(
         zinc_xyz,
         args.co2_shell_inner,
         args.co2_shell_outer,
+        placement_mode=configuration["placement_mode"],
+        site_direction=site_direction,
     ))
     command = [args.packmol]
     started_at = datetime.now(timezone.utc).isoformat()
@@ -4525,11 +4878,58 @@ def run_co2_pack_stage(
         "configuration": configuration,
         "execution_resources": co2_execution_resources(args),
     }
+    if site_direction is not None:
+        runtime["site_direction"] = site_direction
     mark_stage_running(stage_dir, runtime)
     print(
         f"  PACK {system_name}/NCO2_{co2_count:02d}/pack_{pack_index:02d} "
         f"(seed {seed})"
     )
+    print(f"       CO2 placement mode       : {configuration['placement_mode']}")
+    if site_direction is not None:
+        unit_vector = " ".join(
+            f"{value:.6f}" for value in site_direction["unit_vector"]
+        )
+        target_center = " ".join(
+            f"{value:.6f}" for value in site_direction["target_xyz_A"]
+        )
+        zinc_center = " ".join(
+            f"{value:.6f}" for value in site_direction["zinc_xyz_A"]
+        )
+        reference_center = " ".join(
+            f"{value:.6f}"
+            for value in site_direction["direction_atom_xyz_A"]
+        )
+        print(f"       Zn atom index            : {site_direction['zinc_index']}")
+        print(f"       Zn xyz                   : {zinc_center}")
+        print(
+            "       Direction atom index     : "
+            f"{site_direction['direction_atom_index']}"
+        )
+        print(
+            "       Direction atom element   : "
+            f"{site_direction['direction_atom_element']}"
+        )
+        print(f"       Direction atom xyz       : {reference_center}")
+        print(
+            "       Zn-direction distance    : "
+            f"{site_direction['zn_direction_atom_distance_A']:.6f} A"
+        )
+        print(f"       Direction unit vector    : {unit_vector}")
+        print(
+            "       Target distance from Zn  : "
+            f"{site_direction['target_distance_A']:.6f} A"
+        )
+        print(
+            f"       Target radius            : "
+            f"{site_direction['target_radius_A']:.6f} A"
+        )
+        print(f"       Target center            : {target_center}")
+        print("       Targeted CO2             : molecule 1")
+        print("       Targeted CO2 molecules   : 1")
+        print(
+            f"       Background CO2 molecules : {co2_count - 1}"
+        )
 
     returncode = None
     try:
@@ -4561,6 +4961,7 @@ def run_co2_pack_stage(
             co2_count,
             args.co2_shell_inner,
             args.co2_shell_outer,
+            site_direction=site_direction,
         )
         final_centering = center_pdb(packed_pdb, final_centered)
         centered_validation = validate_co2_centered_geometry(
@@ -4571,6 +4972,7 @@ def run_co2_pack_stage(
             co2_count,
             args.co2_shell_inner,
             args.co2_shell_outer,
+            site_direction=site_direction,
         )
         wall_radius_A = final_centering["max_radius_from_COM_A"] + args.wall_margin
         wall_radius_bohr = wall_radius_A * BOHR_PER_ANGSTROM
@@ -4634,8 +5036,26 @@ def run_co2_pack_stage(
                 name: file_sha256(stage_dir / name) for name in output_names
             },
         }
+        if site_direction is not None:
+            manifest["site_direction"] = site_direction
+            manifest["site_directed_scientific_note"] = (
+                CO2_SITE_DIRECTED_NOTE
+            )
         _write_json(stage_dir / "stage_manifest.json", manifest)
         mark_stage_done(stage_dir)
+        if site_direction is not None:
+            print(
+                "       Targeted Zn-C            : "
+                f"{packing_validation['targeted_Zn_C_distance_A']:.6f} A"
+            )
+            print(
+                "       C-target distance        : "
+                f"{packing_validation['targeted_target_point_distance_A']:.6f} A"
+            )
+            print(
+                "       Zn-direction/C angle     : "
+                f"{packing_validation['targeted_direction_angle_degrees']:.6f} deg"
+            )
         print(f"  OK   {stage_dir}")
         return manifest
     except (OSError, RuntimeError, ValueError) as exc:
@@ -4654,6 +5074,11 @@ def run_co2_pack_stage(
             "source_structure_type": "full-droplet representative frame",
             "scientific_note": CO2_WORKFLOW_NOTE,
         }
+        if site_direction is not None:
+            failure["site_direction"] = site_direction
+            failure["site_directed_scientific_note"] = (
+                CO2_SITE_DIRECTED_NOTE
+            )
         _write_json(stage_dir / "stage_manifest.json", failure)
         mark_stage_failed(stage_dir, str(exc))
         raise RuntimeError(
@@ -5561,10 +5986,14 @@ def run_co2_md_stage(
 
 
 PACKING_SUMMARY_FIELDS = [
-    "system", "n_CO2", "pack_index", "seed", "shell_inner_A",
-    "shell_outer_A", "n_atoms", "min_Zn_C_A", "mean_Zn_C_A",
-    "max_Zn_C_A", "min_CO2_source_A", "min_CO2_CO2_A",
-    "packing_status",
+    "system", "n_CO2", "pack_index", "seed", "placement_mode",
+    "direction_atom_index", "direction_atom_element", "target_distance_A",
+    "target_radius_A", "targeted_CO2_index",
+    "targeted_carbon_atom_index", "targeted_Zn_C_A",
+    "targeted_target_distance_A", "targeted_direction_angle_deg",
+    "site_direction_valid", "shell_inner_A", "shell_outer_A", "n_atoms",
+    "min_Zn_C_A", "mean_Zn_C_A", "max_Zn_C_A",
+    "min_CO2_source_A", "min_CO2_CO2_A", "packing_status",
 ]
 
 ACCOMMODATION_SUMMARY_FIELDS = [
@@ -5636,11 +6065,55 @@ def rebuild_co2_summaries(system_dir: Path):
             validation = manifest.get("packing_validation", {})
             metrics = validation.get("metrics", {})
             composition = manifest.get("composition", {})
+            site_direction = manifest.get("site_direction", {})
+            placement_mode = config.get("placement_mode", "random-shell")
+            site_directed = placement_mode == "site-directed"
             packing_rows.append({
                 "system": config.get("system"),
                 "n_CO2": config.get("co2_count"),
                 "pack_index": config.get("pack_index"),
                 "seed": config.get("packmol_seed"),
+                "placement_mode": placement_mode,
+                "direction_atom_index": (
+                    site_direction.get("direction_atom_index")
+                    if site_directed else None
+                ),
+                "direction_atom_element": (
+                    site_direction.get("direction_atom_element")
+                    if site_directed else None
+                ),
+                "target_distance_A": (
+                    site_direction.get("target_distance_A")
+                    if site_directed else None
+                ),
+                "target_radius_A": (
+                    site_direction.get("target_radius_A")
+                    if site_directed else None
+                ),
+                "targeted_CO2_index": (
+                    validation.get("targeted_CO2_index")
+                    if site_directed else None
+                ),
+                "targeted_carbon_atom_index": (
+                    validation.get("targeted_carbon_atom_index")
+                    if site_directed else None
+                ),
+                "targeted_Zn_C_A": (
+                    validation.get("targeted_Zn_C_distance_A")
+                    if site_directed else None
+                ),
+                "targeted_target_distance_A": (
+                    validation.get("targeted_target_point_distance_A")
+                    if site_directed else None
+                ),
+                "targeted_direction_angle_deg": (
+                    validation.get("targeted_direction_angle_degrees")
+                    if site_directed else None
+                ),
+                "site_direction_valid": (
+                    validation.get("site_direction_valid")
+                    if site_directed else None
+                ),
                 "shell_inner_A": config.get("shell_inner_A"),
                 "shell_outer_A": config.get("shell_outer_A"),
                 "n_atoms": composition.get("n_total_atoms"),
@@ -6016,6 +6489,7 @@ def run_co2_workflow(args, system_name: str):
         f"Shell around Zn: {args.co2_shell_inner:.3f}-"
         f"{args.co2_shell_outer:.3f} A"
     )
+    print(f"CO2 placement mode: {args.co2_placement_mode}")
     print(CO2_WORKFLOW_NOTE)
     resources = co2_execution_resources(args)
     print(f"CO2 concurrent jobs     : {resources['co2_parallel_jobs']}")
@@ -6411,6 +6885,43 @@ def parse_args():
         help="One or more CO2 molecule counts, e.g. 1 2 4 8.",
     )
     co2.add_argument(
+        "--co2-placement-mode",
+        choices=["random-shell", "site-directed"],
+        default="random-shell",
+        help=(
+            "Initial CO2 Packmol placement: historical random shell or one "
+            "site-directed molecule plus random-shell background "
+            "(default: random-shell)."
+        ),
+    )
+    co2.add_argument(
+        "--co2-direction-atom",
+        type=int,
+        default=None,
+        metavar="INT",
+        help=(
+            "1-based ordinal ATOM/HETATM index in --co2-source-pdb used "
+            "to define site direction. Required for site-directed mode."
+        ),
+    )
+    co2.add_argument(
+        "--co2-target-distance",
+        type=float,
+        default=None,
+        metavar="ANGSTROM",
+        help=(
+            "Zn-to-target distance in A; default is the midpoint of the "
+            "requested Zn shell."
+        ),
+    )
+    co2.add_argument(
+        "--co2-target-radius",
+        type=float,
+        default=1.5,
+        metavar="ANGSTROM",
+        help="Site-directed target-sphere radius in A (default: 1.5).",
+    )
+    co2.add_argument(
         "--co2-shell-inner",
         type=float,
         default=4.0,
@@ -6602,11 +7113,51 @@ def validate_args(args):
             raise SystemExit("Every --co2-counts value must be >= 1.")
         if len(set(args.co2_counts)) != len(args.co2_counts):
             raise SystemExit("--co2-counts must not contain duplicates.")
-        if args.co2_shell_inner <= 0:
+        if (
+            not math.isfinite(args.co2_shell_inner)
+            or args.co2_shell_inner <= 0
+        ):
             raise SystemExit("--co2-shell-inner must be > 0.")
-        if args.co2_shell_outer <= args.co2_shell_inner:
+        if (
+            not math.isfinite(args.co2_shell_outer)
+            or args.co2_shell_outer <= args.co2_shell_inner
+        ):
             raise SystemExit(
                 "--co2-shell-outer must be greater than --co2-shell-inner."
+            )
+        if (
+            args.co2_placement_mode == "site-directed"
+            and args.co2_direction_atom is None
+        ):
+            raise SystemExit(
+                "--co2-placement-mode site-directed requires "
+                "--co2-direction-atom INT."
+            )
+        if (
+            args.co2_direction_atom is not None
+            and args.co2_direction_atom < 1
+        ):
+            raise SystemExit("--co2-direction-atom must be >= 1.")
+        if (
+            not math.isfinite(args.co2_target_radius)
+            or args.co2_target_radius <= 0
+        ):
+            raise SystemExit("--co2-target-radius must be > 0.")
+        target_distance_A = co2_effective_target_distance(
+            args.co2_shell_inner,
+            args.co2_shell_outer,
+            args.co2_target_distance,
+        )
+        if not math.isfinite(target_distance_A) or target_distance_A <= 0:
+            raise SystemExit("--co2-target-distance must be > 0.")
+        if not (
+            args.co2_shell_inner
+            <= target_distance_A
+            <= args.co2_shell_outer
+        ):
+            raise SystemExit(
+                "--co2-target-distance must lie within the requested "
+                "Zn shell."
             )
         if args.co2_pack_replicas < 1:
             raise SystemExit("--co2-pack-replicas must be >= 1.")
@@ -6708,6 +7259,10 @@ def validate_args(args):
         or args.co2_source_pdb is not None
         or args.co2_pdb is not None
         or args.co2_counts
+        or args.co2_placement_mode != "random-shell"
+        or args.co2_direction_atom is not None
+        or args.co2_target_distance is not None
+        or args.co2_target_radius != 1.5
         or args.co2_shell_inner != 4.0
         or args.co2_shell_outer != 6.0
         or args.co2_pack_replicas != 1
