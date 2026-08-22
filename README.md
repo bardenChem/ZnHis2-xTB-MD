@@ -274,6 +274,51 @@ This is only an initial-condition generator. The target sphere is absent from
 atoms remain free. It must not be interpreted as spontaneous access from bulk,
 binding, docking, a reaction coordinate, or a free-energy calculation.
 
+To replace one explicitly selected solvent water with the first CO2 molecule,
+use `water-replacement`. The oxygen index is the 1-based ordinal position among
+the `ATOM`/`HETATM` records read from the source PDB—not a PDB serial, residue
+number, PyMOL index, or automatically selected proximal water:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system T4_IV_Hudecova \
+    --co2-shell-screen \
+    --co2-source-pdb T4_IV_open_medoid_full.pdb \
+    --co2-pdb co2.pdb \
+    --co2-counts 1 2 \
+    --co2-placement-mode water-replacement \
+    --co2-replace-water-oxygen-atom 301 \
+    --co2-replacement-radius 1.0 \
+    --co2-shell-inner 4.0 \
+    --co2-shell-outer 8.0 \
+    --co2-pack-replicas 1 \
+    --co2-project co2_water_replacement_open \
+    --co2-seed-base 192911
+```
+
+The `301` above is only an example for that particular source and is never
+hardcoded. The workflow verifies that it is a solvent O in one consecutive H2O
+triplet, removes exactly that O and its two H atoms, and preserves the intact
+`source_medoid.pdb`. Packmol fixes `source_water_removed_centered.pdb`; carbon
+of CO2 molecule 1 must be both in the requested Zn--C shell and within
+`--co2-replacement-radius` of the removed O position transformed into the
+reduced source's centered frame. For `NCO2 > 1`, only molecule 1 targets this
+cavity and all remaining CO2 molecules use the ordinary shell.
+
+For an original source with `S` atoms and `W` waters, water replacement gives
+`S - 3 + 3*NCO2` atoms and `W - 1` waters. Thus `NCO2=1` retains `S` total
+atoms, while `NCO2=2` gives `S + 3`. The manifest records the original water
+identity, removed atom ordinals, original Zn--O distance, effective-source
+composition, and replacement validation. Changing the selected oxygen or
+replacement radius invalidates stage-06 reuse and requires `--co2-repack` to
+archive and regenerate it.
+
+This mode is also only a deliberately prepared initial condition. It does not
+demonstrate spontaneous water displacement, CO2 binding, desolvation
+equilibrium, or a substitution mechanism. Its Packmol target sphere does not
+persist in 07--10: the remaining waters and all CO2 molecules are mobile in
+accommodation, and all atoms are free during MD.
+
 After inspecting every `system_CO2_centered.pdb`, repeat the same command with
 the desired xTB allocation and `--run`:
 
@@ -363,6 +408,8 @@ co2_screening/<SYSTEM>/
         ├── 06_CO2_shell_pack/
         │   ├── source_medoid.pdb
         │   ├── source_centered.pdb
+        │   ├── source_water_removed.pdb          # water-replacement only
+        │   ├── source_water_removed_centered.pdb # water-replacement only
         │   ├── co2.pdb
         │   ├── 06_CO2_shell_pack.inp
         │   ├── 06_CO2_shell_pack.out
