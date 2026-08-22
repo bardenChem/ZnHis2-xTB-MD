@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -171,12 +172,25 @@ EXECUTION_STAGES = ["00_relax", *(stage["name"] for stage in STAGES)]
 EXECUTION_PROVENANCE_ONLY_FIELDS = frozenset({"threads"})
 CO2_PACK_STAGE = "06_CO2_shell_pack"
 CO2_ACCOMMODATION_STAGE = "07_CO2_accommodation"
+CO2_EQUIL_STAGE = "08_CO2_298K_equil"
+CO2_SCREEN_STAGE = "09_CO2_298K_screen"
+CO2_EXTENDED_STAGE = "10_CO2_298K_extended"
+CO2_MD_STAGE_NAMES = (
+    CO2_EQUIL_STAGE,
+    CO2_SCREEN_STAGE,
+    CO2_EXTENDED_STAGE,
+)
+CO2_START_STAGE_CHOICES = (
+    CO2_ACCOMMODATION_STAGE,
+    *CO2_MD_STAGE_NAMES,
+)
 CO2_WORKFLOW_NOTE = (
     "This CO2 workflow is a new condition derived from a previously "
     "equilibrated aqueous configuration. It is not a dynamical continuation "
     "of stage 05."
 )
 PDB_COORDINATE_TOLERANCE_A = 0.002
+SPEED_OF_LIGHT_CM_S = 2.99792458e10
 
 FATAL_MD_PATTERNS = [
     "MD is unstable",
@@ -718,11 +732,12 @@ def md_step_count(stage: dict) -> int:
 
 def md_input(stage, wall_radius_bohr: float) -> str:
     restart = "true" if stage["restart"] else "false"
+    dump_fs = stage.get("dump_fs", MD_DUMP_FS)
 
     return f"""$md
    temp={stage['temp']:.2f}
    time={stage['time']:.3f}
-   dump={MD_DUMP_FS:.1f}
+   dump={dump_fs:.1f}
    step={MD_STEP_FS:.1f}
    velo=true
    nvt=true
@@ -2126,15 +2141,23 @@ def parse_mdrestart(path: Path, expected_atoms: int) -> dict:
     }
 
 
-def md_expected_frame_count(stage: dict) -> int:
-    exact_frames = stage["time"] * 1000.0 / MD_DUMP_FS
+def expected_md_frames(time_ps: float, dump_fs: float, stage_name: str) -> int:
+    exact_frames = time_ps * 1000.0 / dump_fs
     frames = round(exact_frames)
     if not math.isclose(exact_frames, frames, abs_tol=1.0e-9):
         raise ValueError(
-            f"Stage {stage['name']} duration/dump interval does not yield "
+            f"Stage {stage_name} duration/dump interval does not yield "
             "an integral nominal frame count."
         )
     return frames
+
+
+def md_expected_frame_count(stage: dict) -> int:
+    return expected_md_frames(
+        stage["time"],
+        stage.get("dump_fs", MD_DUMP_FS),
+        stage["name"],
+    )
 
 
 def _finite_values(fields, *, context: str):
@@ -2156,6 +2179,7 @@ def validate_xtb_trajectory(
     expected_atoms: int,
     expected_frames: int,
     require_velocities: bool,
+    expected_elements=None,
 ) -> dict:
     """Stream-validate xTB extended XYZ coordinates and velocity blocks."""
     if not path.is_file():
@@ -2220,6 +2244,14 @@ def validate_xtb_trajectory(
 
             if element_order is None:
                 element_order = tuple(frame_elements)
+                if (
+                    expected_elements is not None
+                    and element_order != tuple(expected_elements)
+                ):
+                    raise RuntimeError(
+                        f"Invalid trajectory {path}: first-frame element "
+                        "order differs from the input geometry."
+                    )
             elif tuple(frame_elements) != element_order:
                 raise RuntimeError(
                     f"Invalid trajectory {path}: element order changes at "
@@ -3667,6 +3699,116 @@ def run_replica(replica_dir: Path, args):
 # Independent CO2 shell-screening workflow
 # ---------------------------------------------------------------------------
 
+def co2_md_stages(args) -> list[dict]:
+    """Build the independent CO2 MD protocol from explicit CLI values."""
+    equilibration = {
+        "name": CO2_EQUIL_STAGE,
+        "temp": 298.15,
+        "time": args.co2_equil_time_ps,
+        "dump_fs": args.co2_equil_dump_fs,
+        "restart": False,
+        "velocities_reinitialized": True,
+        "continuation": False,
+        "source_stage": CO2_ACCOMMODATION_STAGE,
+        "equilibration_time_ps": args.co2_equil_time_ps,
+        "production_time_ps": 0.0,
+        "cumulative_production_time_ps": 0.0,
+        "purpose": (
+            "Short NVT equilibration after CO2 insertion and structural "
+            "accommodation. New velocities are initialized at 298.15 K."
+        ),
+    }
+    screen = {
+        "name": CO2_SCREEN_STAGE,
+        "temp": 298.15,
+        "time": args.co2_screen_time_ps,
+        "dump_fs": args.co2_production_dump_fs,
+        "restart": True,
+        "restart_from": CO2_EQUIL_STAGE,
+        "velocities_reinitialized": False,
+        "continuation": True,
+        "continuation_of": CO2_EQUIL_STAGE,
+        "equilibration_time_ps": args.co2_equil_time_ps,
+        "production_time_ps": args.co2_screen_time_ps,
+        "cumulative_production_time_ps": args.co2_screen_time_ps,
+        "purpose": "Initial unbiased production/screening trajectory with CO2.",
+    }
+    extended = {
+        "name": CO2_EXTENDED_STAGE,
+        "temp": 298.15,
+        "time": args.co2_extended_time_ps,
+        "dump_fs": args.co2_production_dump_fs,
+        "restart": True,
+        "restart_from": CO2_SCREEN_STAGE,
+        "velocities_reinitialized": False,
+        "continuation": True,
+        "continuation_of": CO2_SCREEN_STAGE,
+        "equilibration_time_ps": args.co2_equil_time_ps,
+        "production_time_ps": args.co2_extended_time_ps,
+        "cumulative_production_time_ps": (
+            args.co2_screen_time_ps + args.co2_extended_time_ps
+        ),
+        "purpose": "Opt-in extended unbiased production trajectory with CO2.",
+    }
+    for stage in (equilibration, screen, extended):
+        stage["steps"] = md_step_count(stage)
+        stage["expected_frames"] = md_expected_frame_count(stage)
+    return [equilibration, screen, extended]
+
+
+def co2_md_input(stage: dict, wall_radius_bohr: float) -> str:
+    """Create an unconstrained CO2 MD input with the stage-specific dump."""
+    return md_input(stage, wall_radius_bohr)
+
+
+def co2_md_command(args, stage: dict) -> list[str]:
+    command = [
+        args.xtb,
+        "system_CO2_accommodated.pdb",
+        "--gfn", str(args.gfn),
+        "--chrg", str(args.charge),
+        "--uhf", str(args.uhf),
+        "--md",
+        "--input", f"{stage['name']}.inp",
+    ]
+    if args.alpb:
+        command += ["--alpb", args.alpb]
+    return command
+
+
+def co2_sampling_metadata(dump_fs: float, velocities_present: bool) -> dict:
+    sampling_frequency_hz = 1.0 / (dump_fs * 1.0e-15)
+    return {
+        "trajectory_sampling_interval_fs": dump_fs,
+        "sampling_frequency_Hz": sampling_frequency_hz,
+        "nyquist_wavenumber_cm-1": (
+            sampling_frequency_hz / (2.0 * SPEED_OF_LIGHT_CM_S)
+        ),
+        "spectroscopy_sampling_ready": (
+            dump_fs <= 2.0 and velocities_present
+        ),
+        "spectroscopy_sampling_note": (
+            "Temporal sampling suitable for subsequent vibrational "
+            "power-spectrum / VDOS analysis; this is not an IR spectrum."
+        ),
+    }
+
+
+def co2_execution_resources(args) -> dict:
+    parallel_jobs = getattr(args, "co2_parallel_jobs", 1)
+    detected_cpus = os.cpu_count()
+    maximum_requested = parallel_jobs * args.threads
+    return {
+        "co2_parallel_jobs": parallel_jobs,
+        "xtb_threads_per_job": args.threads,
+        "maximum_requested_cpus": maximum_requested,
+        "detected_cpu_count": detected_cpus,
+        "oversubscription_warning": (
+            detected_cpus is not None and maximum_requested > detected_cpus
+        ),
+    }
+
+
 def _validated_pdb_atoms(path: Path, description: str):
     try:
         atoms = pdb_atoms(path)
@@ -4381,6 +4523,7 @@ def run_co2_pack_stage(
         "hostname": socket.gethostname(),
         "command": command,
         "configuration": configuration,
+        "execution_resources": co2_execution_resources(args),
     }
     mark_stage_running(stage_dir, runtime)
     print(
@@ -4689,7 +4832,11 @@ def run_co2_accommodation_stage(
     source_metadata: dict,
     template_metadata: dict,
     args,
+    *,
+    force: bool | None = None,
 ) -> dict:
+    if force is None:
+        force = args.force
     pack_stage_dir = condition_dir / CO2_PACK_STAGE
     packing_manifest_path = pack_stage_dir / "stage_manifest.json"
     stage_dir = condition_dir / CO2_ACCOMMODATION_STAGE
@@ -4700,7 +4847,7 @@ def run_co2_accommodation_stage(
     pack_index = configuration["pack_index"]
     system_name = configuration["system"]
 
-    if (stage_dir / "stage.done").is_file() and not args.force:
+    if (stage_dir / "stage.done").is_file() and not force:
         manifest = validate_completed_co2_accommodation(
             stage_dir, configuration, source_metadata, template_metadata
         )
@@ -4710,7 +4857,7 @@ def run_co2_accommodation_stage(
         )
         return manifest
     active_entries = _co2_stage_active_entries(stage_dir)
-    if active_entries and not args.force:
+    if active_entries and not force:
         names = ", ".join(path.name for path in active_entries[:6])
         raise RuntimeError(
             f"Existing incomplete or failed {CO2_ACCOMMODATION_STAGE} "
@@ -4751,12 +4898,13 @@ def run_co2_accommodation_stage(
         "hostname": socket.gethostname(),
         "command": recorded_command,
         "configuration": configuration,
+        "execution_resources": co2_execution_resources(args),
     }
     mark_stage_running(stage_dir, runtime)
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.threads)
-    env.setdefault("MKL_NUM_THREADS", str(args.threads))
-    env.setdefault("OMP_STACKSIZE", "4G")
+    env["MKL_NUM_THREADS"] = str(args.threads)
+    env["OMP_STACKSIZE"] = "4G"
     print(
         f"  ACCOMMODATE {system_name}/NCO2_{co2_count:02d}/"
         f"pack_{pack_index:02d}"
@@ -4852,6 +5000,563 @@ def run_co2_accommodation_stage(
         raise RuntimeError(
             f"{CO2_ACCOMMODATION_STAGE} failed in {stage_dir}: {exc} "
             f"Outputs were preserved for diagnosis; see {log_path}."
+        ) from exc
+
+
+def co2_md_configuration(
+    condition_dir: Path,
+    stage: dict,
+    packing_manifest: dict,
+    accommodation_manifest: dict,
+    previous_manifest: dict | None,
+    args,
+) -> dict:
+    packing_configuration = packing_manifest["configuration"]
+    composition = packing_manifest["composition"]
+    geometry = condition_dir / CO2_ACCOMMODATION_STAGE / (
+        "system_CO2_accommodated.pdb"
+    )
+    accommodation_manifest_path = (
+        condition_dir / CO2_ACCOMMODATION_STAGE / "stage_manifest.json"
+    )
+    input_restart_sha256 = None
+    predecessor_manifest_sha256 = None
+    if stage["restart"]:
+        if previous_manifest is None:
+            raise RuntimeError(
+                f"{stage['name']} requires a validated predecessor manifest."
+            )
+        input_restart_sha256 = previous_manifest.get("output_restart_sha256")
+        predecessor_manifest_path = (
+            condition_dir / stage["restart_from"] / "stage_manifest.json"
+        )
+        predecessor_manifest_sha256 = file_sha256(predecessor_manifest_path)
+
+    configuration = {
+        "workflow": "CO2_shell_screening_MD",
+        "stage": stage["name"],
+        "system": packing_configuration["system"],
+        "n_CO2": packing_configuration["co2_count"],
+        "pack_index": packing_configuration["pack_index"],
+        "input_geometry": "system_CO2_accommodated.pdb",
+        "input_geometry_sha256": file_sha256(geometry),
+        "accommodation_manifest_sha256": file_sha256(
+            accommodation_manifest_path
+        ),
+        "predecessor_manifest_sha256": predecessor_manifest_sha256,
+        "n_atoms": composition["n_total_atoms"],
+        "n_solute_atoms": composition["n_solute_atoms"],
+        "n_waters": composition["n_waters"],
+        "gfn": args.gfn,
+        "charge": args.charge,
+        "uhf": args.uhf,
+        "alpb": args.alpb,
+        "threads": args.threads,
+        "temp_K": stage["temp"],
+        "time_ps": stage["time"],
+        "step_fs": MD_STEP_FS,
+        "dump_fs": stage["dump_fs"],
+        "steps": stage["steps"],
+        "expected_frames": stage["expected_frames"],
+        "nvt": True,
+        "velo": True,
+        "hmass": 1,
+        "shake": 0,
+        "sccacc": 1.0,
+        "restart": stage["restart"],
+        "restart_from": stage.get("restart_from"),
+        "continuation": stage["continuation"],
+        "continuation_of": stage.get("continuation_of"),
+        "velocities_reinitialized": stage["velocities_reinitialized"],
+        "mdrestart_input_used": stage["restart"],
+        "input_restart_sha256": input_restart_sha256,
+        "wall_radius_A": packing_manifest["wall"]["radius_A"],
+        "wall_radius_bohr": packing_manifest["wall"]["radius_bohr"],
+        "equilibration_time_ps": stage["equilibration_time_ps"],
+        "production_time_ps": stage["production_time_ps"],
+        "cumulative_production_time_ps": (
+            stage["cumulative_production_time_ps"]
+        ),
+        "source_stage": (
+            CO2_ACCOMMODATION_STAGE
+            if not stage["restart"]
+            else stage["restart_from"]
+        ),
+    }
+    return configuration
+
+
+def co2_extended_disk_preflight(
+    condition_dir: Path,
+    stage: dict,
+    previous_manifest: dict,
+) -> dict:
+    previous_trajectory = condition_dir / CO2_SCREEN_STAGE / "xtb.trj"
+    if not previous_trajectory.is_file():
+        raise RuntimeError(
+            f"Cannot estimate {stage['name']} disk space: missing "
+            f"{previous_trajectory}."
+        )
+    previous_size = previous_trajectory.stat().st_size
+    previous_integrity = previous_manifest.get("trajectory_integrity", {})
+    if previous_integrity.get("size_bytes") != previous_size:
+        raise RuntimeError(
+            f"Cannot estimate {stage['name']} disk space: stage-09 "
+            "trajectory size differs from its manifest."
+        )
+    if previous_integrity.get("sha256") != file_sha256(previous_trajectory):
+        raise RuntimeError(
+            f"Cannot estimate {stage['name']} disk space: stage-09 "
+            "trajectory hash differs from its manifest."
+        )
+    previous_time = previous_manifest["configuration"]["time_ps"]
+    previous_dump = previous_manifest["configuration"]["dump_fs"]
+    scale = (stage["time"] / previous_time) * (
+        previous_dump / stage["dump_fs"]
+    )
+    estimated_trajectory_bytes = math.ceil(previous_size * scale)
+    safety_factor = 1.25
+    required_free_bytes = math.ceil(
+        estimated_trajectory_bytes * safety_factor
+    )
+    disk = shutil.disk_usage(condition_dir)
+    record = {
+        "source_stage": CO2_SCREEN_STAGE,
+        "source_trajectory": str(previous_trajectory),
+        "source_trajectory_bytes": previous_size,
+        "duration_and_dump_scale": scale,
+        "estimated_trajectory_bytes": estimated_trajectory_bytes,
+        "safety_factor": safety_factor,
+        "required_free_bytes": required_free_bytes,
+        "available_free_bytes": disk.free,
+        "sufficient": disk.free >= required_free_bytes,
+    }
+    return record
+
+
+def _co2_md_required_outputs(stage: dict) -> list[str]:
+    required = [
+        "stage.done",
+        "stage_manifest.json",
+        f"{stage['name']}.inp",
+        f"{stage['name']}.out",
+        "system_CO2_accommodated.pdb",
+        "xtb.trj",
+        "mdrestart",
+        "xtbmdok",
+    ]
+    if stage["restart"]:
+        required.append("mdrestart.input")
+    return required
+
+
+def validate_completed_co2_md_stage(
+    condition_dir: Path,
+    stage: dict,
+    expected_configuration: dict,
+    expected_elements: list[str],
+    args,
+) -> dict:
+    stage_dir = condition_dir / stage["name"]
+    conflicts = [
+        marker for marker in ("stage.failed", "stage.running")
+        if (stage_dir / marker).exists()
+    ]
+    if conflicts:
+        raise RuntimeError(
+            f"Completed {stage['name']} has conflicting markers: "
+            f"{', '.join(conflicts)}. Inspect it and use --force."
+        )
+    missing = [
+        name for name in _co2_md_required_outputs(stage)
+        if not (stage_dir / name).is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: missing archived outputs "
+            f"({', '.join(missing)})."
+        )
+    manifest = _read_json_dict(
+        stage_dir / "stage_manifest.json", "CO2 MD stage manifest"
+    )
+    if manifest.get("status") != "completed":
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: manifest status is "
+            f"{manifest.get('status')!r}."
+        )
+    recorded_configuration = manifest.get("configuration")
+    if not isinstance(recorded_configuration, dict):
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: missing configuration."
+        )
+    mismatches = configuration_mismatches(
+        expected_configuration, recorded_configuration
+    )
+    if mismatches:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: provenance is incompatible "
+            f"(fields: {', '.join(mismatches)}). Use --force to archive "
+            "and rerun this stage."
+        )
+    _validate_co2_output_hashes(stage_dir, manifest)
+    geometry = stage_dir / "system_CO2_accommodated.pdb"
+    if file_sha256(geometry) != expected_configuration["input_geometry_sha256"]:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: input geometry hash changed."
+        )
+    geometry_atoms = _validated_pdb_atoms(geometry, "CO2 MD input geometry")
+    if len(geometry_atoms) != expected_configuration["n_atoms"]:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: input geometry atom count changed."
+        )
+    input_path = stage_dir / f"{stage['name']}.inp"
+    expected_input = co2_md_input(
+        stage, expected_configuration["wall_radius_bohr"]
+    )
+    if input_path.read_text() != expected_input:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: xTB input content changed."
+        )
+
+    input_restart_sha256 = expected_configuration["input_restart_sha256"]
+    if stage["restart"]:
+        input_restart = stage_dir / "mdrestart.input"
+        parse_mdrestart(input_restart, expected_configuration["n_atoms"])
+        if file_sha256(input_restart) != input_restart_sha256:
+            raise RuntimeError(
+                f"Cannot reuse {stage['name']}: mdrestart.input does not "
+                "match the validated predecessor restart."
+            )
+    elif (stage_dir / "mdrestart.input").exists():
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: restart=false stage contains "
+            "mdrestart.input."
+        )
+
+    output_restart_sha256 = validate_output_restart(
+        stage_dir / "mdrestart",
+        input_restart_sha256,
+        expected_atoms=expected_configuration["n_atoms"],
+    )
+    if manifest.get("output_restart_sha256") != output_restart_sha256:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: output restart hash differs "
+            "from the manifest."
+        )
+    trajectory = validate_xtb_trajectory(
+        stage_dir / "xtb.trj",
+        expected_atoms=expected_configuration["n_atoms"],
+        expected_frames=stage["expected_frames"],
+        require_velocities=True,
+        expected_elements=expected_elements,
+    )
+    recorded_trajectory = manifest.get("trajectory_integrity", {})
+    for field in (
+        "sha256", "size_bytes", "n_atoms", "frames",
+        "expected_nominal_frames", "velocities_present",
+    ):
+        if recorded_trajectory.get(field) != trajectory.get(field):
+            raise RuntimeError(
+                f"Cannot reuse {stage['name']}: trajectory integrity field "
+                f"{field} differs from the manifest."
+            )
+    log_validation = inspect_md_log(stage_dir / f"{stage['name']}.out")
+    if log_validation["fatal_patterns"]:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: log contains fatal patterns."
+        )
+    warning_accepted = (
+        log_validation["thermostating_problem"]
+        and log_validation["normal_exit_of_md"]
+        and thermostat_warning_allowed(
+            args.thermostat_warning_policy, stage["name"]
+        )
+    )
+    if log_validation["thermostating_problem"] and not warning_accepted:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: unaccepted thermostating problem."
+        )
+    expected_thermal_result = md_thermal_result(
+        stage,
+        log_validation,
+        args.thermostat_warning_policy,
+        warning_accepted,
+    )
+    recorded_thermal_result = manifest.get("thermal_result")
+    if recorded_thermal_result != expected_thermal_result:
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: thermal_result is inconsistent "
+            "with the archived log and current warning policy."
+        )
+    if not isinstance(manifest.get("xtb_version"), str):
+        raise RuntimeError(
+            f"Cannot reuse {stage['name']}: xTB version is not recorded."
+        )
+    if stage["name"] in (CO2_SCREEN_STAGE, CO2_EXTENDED_STAGE):
+        sampling = co2_sampling_metadata(
+            stage["dump_fs"], trajectory["velocities_present"]
+        )
+        for field, expected_value in sampling.items():
+            if manifest.get(field) != expected_value:
+                raise RuntimeError(
+                    f"Cannot reuse {stage['name']}: spectroscopy metadata "
+                    f"field {field} is incompatible."
+                )
+    return manifest
+
+
+def run_co2_md_stage(
+    condition_dir: Path,
+    stage: dict,
+    packing_manifest: dict,
+    accommodation_manifest: dict,
+    previous_manifest: dict | None,
+    source_metadata: dict,
+    template_metadata: dict,
+    args,
+    *,
+    force: bool,
+    allow_run: bool,
+) -> dict:
+    stage_dir = condition_dir / stage["name"]
+    configuration = co2_md_configuration(
+        condition_dir,
+        stage,
+        packing_manifest,
+        accommodation_manifest,
+        previous_manifest,
+        args,
+    )
+    accommodated_source = (
+        condition_dir
+        / CO2_ACCOMMODATION_STAGE
+        / "system_CO2_accommodated.pdb"
+    )
+    expected_atoms = _validated_pdb_atoms(
+        accommodated_source, "validated CO2 accommodation"
+    )
+    expected_elements = _element_sequence(expected_atoms)
+    if len(expected_atoms) != configuration["n_atoms"]:
+        raise RuntimeError(
+            f"{stage['name']} composition mismatch: accommodation has "
+            f"{len(expected_atoms)} atoms, expected {configuration['n_atoms']}."
+        )
+
+    if (stage_dir / "stage.done").is_file() and not force:
+        manifest = validate_completed_co2_md_stage(
+            condition_dir,
+            stage,
+            configuration,
+            expected_elements,
+            args,
+        )
+        print(
+            f"  REUSE {configuration['system']}/NCO2_"
+            f"{configuration['n_CO2']:02d}/pack_"
+            f"{configuration['pack_index']:02d}/{stage['name']}"
+        )
+        return manifest
+
+    active_entries = _co2_stage_active_entries(stage_dir)
+    if not allow_run:
+        raise RuntimeError(
+            f"{stage['name']} must already be completed for "
+            f"--co2-start-stage; no reusable stage was found in {stage_dir}."
+        )
+    if active_entries and not force:
+        raise RuntimeError(
+            f"Existing incomplete or failed {stage['name']} attempt in "
+            f"{stage_dir}. Inspect it and use --force to archive and rerun."
+        )
+    xtb_exe = shutil.which(args.xtb)
+    if xtb_exe is None:
+        raise RuntimeError(
+            f"xTB executable '{args.xtb}' not found. Use --xtb /path/to/xtb."
+        )
+    if active_entries:
+        archive = archive_co2_stage_attempt(
+            stage_dir, "Replaced explicitly with --force."
+        )
+        print(f"  ARCHIVE prior {stage['name']} attempt at {archive}")
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    geometry = stage_dir / "system_CO2_accommodated.pdb"
+    input_path = stage_dir / f"{stage['name']}.inp"
+    log_path = stage_dir / f"{stage['name']}.out"
+    shutil.copy2(accommodated_source, geometry)
+    input_path.write_text(
+        co2_md_input(stage, configuration["wall_radius_bohr"])
+    )
+
+    if stage["restart"]:
+        predecessor_restart = (
+            condition_dir / stage["restart_from"] / "mdrestart"
+        )
+        if not predecessor_restart.is_file():
+            raise RuntimeError(
+                f"Validated predecessor restart is missing: "
+                f"{predecessor_restart}."
+            )
+        predecessor_hash = file_sha256(predecessor_restart)
+        if predecessor_hash != configuration["input_restart_sha256"]:
+            raise RuntimeError(
+                f"{stage['name']} predecessor restart changed after "
+                "validation."
+            )
+        shutil.copy2(predecessor_restart, stage_dir / "mdrestart")
+        shutil.copy2(predecessor_restart, stage_dir / "mdrestart.input")
+        if file_sha256(stage_dir / "mdrestart.input") != predecessor_hash:
+            raise RuntimeError(
+                f"{stage['name']} failed to preserve its input restart hash."
+            )
+    elif (stage_dir / "mdrestart").exists():
+        raise RuntimeError(
+            f"{stage['name']} restart=false preflight found stale mdrestart."
+        )
+
+    preflight_disk_space = None
+    requested_command = co2_md_command(args, stage)
+    execution_command = [xtb_exe, *requested_command[1:]]
+    started_at = datetime.now(timezone.utc).isoformat()
+    runtime = {
+        "workflow": "CO2_shell_screening_MD",
+        "stage": stage["name"],
+        "status": "running",
+        "started_at": started_at,
+        "hostname": socket.gethostname(),
+        "command": execution_command,
+        "requested_xtb_executable": args.xtb,
+        "configuration": configuration,
+        "execution_resources": co2_execution_resources(args),
+    }
+    mark_stage_running(stage_dir, runtime)
+    try:
+        if stage["name"] == CO2_EXTENDED_STAGE:
+            preflight_disk_space = co2_extended_disk_preflight(
+                condition_dir, stage, previous_manifest
+            )
+            if not preflight_disk_space["sufficient"]:
+                raise RuntimeError(
+                    f"Insufficient disk space for {stage['name']}: "
+                    "estimated requirement with margin is "
+                    f"{preflight_disk_space['required_free_bytes']} bytes, "
+                    "but only "
+                    f"{preflight_disk_space['available_free_bytes']} bytes "
+                    "are free. No files were deleted."
+                )
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(args.threads)
+        env["MKL_NUM_THREADS"] = str(args.threads)
+        env["OMP_STACKSIZE"] = "4G"
+        print(
+            f"  RUN  {configuration['system']}/NCO2_"
+            f"{configuration['n_CO2']:02d}/pack_"
+            f"{configuration['pack_index']:02d} {stage['name']}"
+        )
+        print(f"       {' '.join(execution_command)}")
+        with log_path.open("w") as log:
+            result = subprocess.run(
+                execution_command,
+                cwd=stage_dir,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+            )
+        if result.returncode != 0:
+            raise RuntimeError(f"xTB returned code {result.returncode}.")
+        log_validation = inspect_md_log(log_path)
+        if log_validation["fatal_patterns"]:
+            raise RuntimeError(
+                "Fatal MD pattern(s): "
+                + ", ".join(log_validation["fatal_patterns"])
+            )
+        trajectory = validate_xtb_trajectory(
+            stage_dir / "xtb.trj",
+            expected_atoms=configuration["n_atoms"],
+            expected_frames=stage["expected_frames"],
+            require_velocities=True,
+            expected_elements=expected_elements,
+        )
+        input_restart_sha256 = configuration["input_restart_sha256"]
+        output_restart_sha256 = validate_output_restart(
+            stage_dir / "mdrestart",
+            input_restart_sha256,
+            expected_atoms=configuration["n_atoms"],
+        )
+        if not (stage_dir / "xtbmdok").is_file():
+            raise RuntimeError("xTB ended without xtbmdok.")
+        warning_accepted = (
+            log_validation["thermostating_problem"]
+            and log_validation["normal_exit_of_md"]
+            and thermostat_warning_allowed(
+                args.thermostat_warning_policy, stage["name"]
+            )
+        )
+        if log_validation["thermostating_problem"] and not warning_accepted:
+            raise RuntimeError("Unaccepted thermostating problem.")
+        thermal_result = md_thermal_result(
+            stage,
+            log_validation,
+            args.thermostat_warning_policy,
+            warning_accepted,
+        )
+        xtb_version = extract_xtb_version(log_path, stage_dir / "xtb.trj")
+        if xtb_version is None:
+            raise RuntimeError(
+                "xTB version could not be determined from log/trajectory."
+            )
+        trajectory = dict(trajectory)
+        trajectory["path"] = "xtb.trj"
+        manifest = {
+            **configuration,
+            **runtime,
+            "status": "completed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": result.returncode,
+            "xtb_version": xtb_version,
+            "input_restart_path": (
+                "mdrestart.input" if stage["restart"] else None
+            ),
+            "output_restart_sha256": output_restart_sha256,
+            "trajectory_integrity": trajectory,
+            "thermal_result": thermal_result,
+            "preflight_disk_space": preflight_disk_space,
+            "composition_changed_relative_to_aqueous": True,
+            "solvation_rebuilt": False,
+            "geometry_reoptimized": False,
+            "coordinates_recentered": False,
+            "output_sha256": _co2_stage_output_hashes(stage_dir),
+        }
+        if stage["name"] in (CO2_SCREEN_STAGE, CO2_EXTENDED_STAGE):
+            manifest.update(co2_sampling_metadata(
+                stage["dump_fs"], trajectory["velocities_present"]
+            ))
+        _write_json(stage_dir / "stage_manifest.json", manifest)
+        mark_stage_done(stage_dir)
+        if warning_accepted:
+            print(
+                f"  WARNING {stage['name']}: accepted thermostating problem "
+                "after complete output/restart validation."
+            )
+        else:
+            print(f"  OK   {stage['name']}")
+        return manifest
+    except (OSError, RuntimeError, ValueError) as exc:
+        failure = {
+            **configuration,
+            **runtime,
+            "status": "failed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "failure_reason": str(exc),
+            "preflight_disk_space": preflight_disk_space,
+            "composition_changed_relative_to_aqueous": True,
+            "output_sha256": _co2_stage_output_hashes(stage_dir),
+        }
+        _write_json(stage_dir / "stage_manifest.json", failure)
+        mark_stage_failed(stage_dir, str(exc))
+        raise RuntimeError(
+            f"{stage['name']} failed in {stage_dir}: {exc} Outputs were "
+            "preserved for diagnosis."
         ) from exc
 
 
@@ -4993,6 +5698,184 @@ def rebuild_co2_summaries(system_dir: Path):
         )
 
 
+CO2_MD_SUMMARY_FIELDS = [
+    "system", "n_CO2", "pack_index",
+    "equil_status", "equil_time_ps", "equil_dump_fs",
+    "equil_average_temperature_K", "equil_frames",
+    "equil_restart_sha256",
+    "screen_status", "screen_time_ps", "screen_dump_fs",
+    "screen_average_temperature_K", "screen_frames",
+    "screen_trajectory_path", "screen_trajectory_sha256",
+    "screen_restart_sha256",
+    "extended_status", "extended_time_ps", "extended_dump_fs",
+    "extended_average_temperature_K", "extended_frames",
+    "extended_trajectory_path", "extended_trajectory_sha256",
+    "extended_restart_sha256", "cumulative_production_time_ps",
+    "spectroscopy_sampling_ready",
+]
+
+
+def _co2_md_summary_stage_values(
+    condition_dir: Path,
+    stage_name: str,
+) -> tuple[dict | None, str]:
+    stage_dir = condition_dir / stage_name
+    manifest_path = stage_dir / "stage_manifest.json"
+    if not manifest_path.is_file():
+        return None, "not_requested"
+    manifest = _read_json_dict(manifest_path, "CO2 MD stage manifest")
+    return manifest, _co2_effective_stage_status(stage_dir, manifest)
+
+
+def rebuild_co2_md_summary(system_dir: Path):
+    rows = []
+    condition_dirs = sorted(
+        system_dir.glob("NCO2_*/pack_*"),
+        key=lambda path: (
+            int(path.parent.name.removeprefix("NCO2_")),
+            int(path.name.removeprefix("pack_")),
+        ),
+    )
+    for condition_dir in condition_dirs:
+        equil, equil_status = _co2_md_summary_stage_values(
+            condition_dir, CO2_EQUIL_STAGE
+        )
+        screen, screen_status = _co2_md_summary_stage_values(
+            condition_dir, CO2_SCREEN_STAGE
+        )
+        extended, extended_status = _co2_md_summary_stage_values(
+            condition_dir, CO2_EXTENDED_STAGE
+        )
+        if equil is None and screen is None and extended is None:
+            continue
+        identity = next(
+            manifest for manifest in (equil, screen, extended)
+            if manifest is not None
+        )
+
+        def config(manifest):
+            return manifest.get("configuration", {}) if manifest else {}
+
+        def thermal(manifest):
+            return manifest.get("thermal_result", {}) if manifest else {}
+
+        def trajectory(manifest):
+            return manifest.get("trajectory_integrity", {}) if manifest else {}
+
+        equil_config = config(equil)
+        screen_config = config(screen)
+        extended_config = config(extended)
+        screen_trajectory = trajectory(screen)
+        extended_trajectory = trajectory(extended)
+        production_manifest = (
+            extended
+            if extended and extended.get("trajectory_integrity")
+            else screen
+        )
+        rows.append({
+            "system": identity.get("system"),
+            "n_CO2": identity.get("n_CO2"),
+            "pack_index": identity.get("pack_index"),
+            "equil_status": equil_status,
+            "equil_time_ps": equil_config.get("time_ps"),
+            "equil_dump_fs": equil_config.get("dump_fs"),
+            "equil_average_temperature_K": thermal(equil).get(
+                "average_temperature_K"
+            ),
+            "equil_frames": trajectory(equil).get("frames"),
+            "equil_restart_sha256": (
+                equil.get("output_restart_sha256") if equil else None
+            ),
+            "screen_status": screen_status,
+            "screen_time_ps": screen_config.get("time_ps"),
+            "screen_dump_fs": screen_config.get("dump_fs"),
+            "screen_average_temperature_K": thermal(screen).get(
+                "average_temperature_K"
+            ),
+            "screen_frames": screen_trajectory.get("frames"),
+            "screen_trajectory_path": (
+                str(stage_relative_path(condition_dir, CO2_SCREEN_STAGE, "xtb.trj"))
+                if screen_trajectory else None
+            ),
+            "screen_trajectory_sha256": screen_trajectory.get("sha256"),
+            "screen_restart_sha256": (
+                screen.get("output_restart_sha256") if screen else None
+            ),
+            "extended_status": extended_status,
+            "extended_time_ps": extended_config.get("time_ps"),
+            "extended_dump_fs": extended_config.get("dump_fs"),
+            "extended_average_temperature_K": thermal(extended).get(
+                "average_temperature_K"
+            ),
+            "extended_frames": extended_trajectory.get("frames"),
+            "extended_trajectory_path": (
+                str(stage_relative_path(
+                    condition_dir, CO2_EXTENDED_STAGE, "xtb.trj"
+                ))
+                if extended_trajectory else None
+            ),
+            "extended_trajectory_sha256": extended_trajectory.get("sha256"),
+            "extended_restart_sha256": (
+                extended.get("output_restart_sha256") if extended else None
+            ),
+            "cumulative_production_time_ps": config(
+                production_manifest
+            ).get("cumulative_production_time_ps"),
+            "spectroscopy_sampling_ready": (
+                production_manifest.get("spectroscopy_sampling_ready")
+                if production_manifest else None
+            ),
+        })
+    summary_path = system_dir / "co2_md_summary.tsv"
+    if rows or summary_path.exists():
+        _write_tsv(summary_path, CO2_MD_SUMMARY_FIELDS, rows)
+
+
+def stage_relative_path(
+    condition_dir: Path,
+    stage_name: str,
+    filename: str,
+) -> Path:
+    return Path(condition_dir.parent.name) / condition_dir.name / stage_name / filename
+
+
+def _co2_marker_status(stage_dir: Path) -> str:
+    if (stage_dir / "stage.failed").exists():
+        return "FAILED"
+    if (stage_dir / "stage.running").exists():
+        return "RUNNING"
+    if (stage_dir / "stage.done").exists():
+        return "OK"
+    return "--"
+
+
+def print_co2_workflow_status(
+    system_dir: Path,
+    condition_specs: list[dict],
+    args,
+):
+    print("\nCO2 workflow summary")
+    print("NCO2  pack  06      07      08      09      10")
+    for spec in condition_specs:
+        condition_dir = spec["condition_dir"]
+        statuses = [
+            _co2_marker_status(condition_dir / stage_name)
+            for stage_name in (
+                CO2_PACK_STAGE,
+                CO2_ACCOMMODATION_STAGE,
+                *CO2_MD_STAGE_NAMES,
+            )
+        ]
+        print(
+            f"{spec['co2_count']:<5d}  {spec['pack_index']:<4d}  "
+            + "  ".join(f"{status:<6s}" for status in statuses)
+        )
+    resources = co2_execution_resources(args)
+    print(f"\nConcurrent jobs: {resources['co2_parallel_jobs']}")
+    print(f"Threads/job: {resources['xtb_threads_per_job']}")
+    print(f"Maximum requested threads: {resources['maximum_requested_cpus']}")
+
+
 def find_co2_pdb(explicit: Path | None = None) -> Path:
     if explicit is not None:
         if not explicit.is_file():
@@ -5007,6 +5890,103 @@ def find_co2_pdb(explicit: Path | None = None) -> Path:
     )
 
 
+def run_co2_condition(
+    condition_spec: dict,
+    system_name: str,
+    source_pdb: Path,
+    co2_pdb: Path,
+    source_metadata: dict,
+    template_metadata: dict,
+    args,
+) -> dict:
+    """Run one independent CO2 branch; stages inside it stay sequential."""
+    condition_dir = condition_spec["condition_dir"]
+    co2_count = condition_spec["co2_count"]
+    pack_index = condition_spec["pack_index"]
+    if (
+        args.co2_start_stage is not None
+        and not (condition_dir / CO2_PACK_STAGE / "stage.done").is_file()
+    ):
+        raise RuntimeError(
+            f"--co2-start-stage requires an existing validated "
+            f"{CO2_PACK_STAGE} in {condition_dir}."
+        )
+    packing_manifest = run_co2_pack_stage(
+        condition_dir,
+        system_name,
+        source_pdb,
+        co2_pdb,
+        source_metadata,
+        template_metadata,
+        co2_count,
+        pack_index,
+        args,
+    )
+    result = {
+        "condition": f"NCO2_{co2_count:02d}/pack_{pack_index:02d}",
+        CO2_PACK_STAGE: "completed",
+    }
+    if not args.run:
+        return result
+
+    accommodation_force = (
+        args.force
+        and args.co2_start_stage in (None, CO2_ACCOMMODATION_STAGE)
+    )
+    if args.co2_start_stage in CO2_MD_STAGE_NAMES:
+        accommodation_configuration = co2_accommodation_configuration(
+            condition_dir / CO2_PACK_STAGE / "stage_manifest.json",
+            packing_manifest,
+            args,
+        )
+        accommodation_manifest = validate_completed_co2_accommodation(
+            condition_dir / CO2_ACCOMMODATION_STAGE,
+            accommodation_configuration,
+            source_metadata,
+            template_metadata,
+        )
+        print(
+            f"  REUSE {system_name}/NCO2_{co2_count:02d}/"
+            f"pack_{pack_index:02d}/{CO2_ACCOMMODATION_STAGE}"
+        )
+    else:
+        accommodation_manifest = run_co2_accommodation_stage(
+            condition_dir,
+            packing_manifest,
+            source_metadata,
+            template_metadata,
+            args,
+            force=accommodation_force,
+        )
+    result[CO2_ACCOMMODATION_STAGE] = "completed"
+
+    if not args.co2_md:
+        return result
+    stages = co2_md_stages(args)
+    stop_index = 2 if args.co2_extended else 1
+    if args.co2_start_stage in CO2_MD_STAGE_NAMES:
+        start_index = CO2_MD_STAGE_NAMES.index(args.co2_start_stage)
+    else:
+        start_index = 0
+    previous_manifest = None
+    for index, stage in enumerate(stages[:stop_index + 1]):
+        allow_run = index >= start_index
+        previous_manifest = run_co2_md_stage(
+            condition_dir,
+            stage,
+            packing_manifest,
+            accommodation_manifest,
+            previous_manifest,
+            source_metadata,
+            template_metadata,
+            args,
+            force=(args.force and allow_run),
+            allow_run=allow_run,
+        )
+        result[stage["name"]] = "completed"
+    return result
+
+
 def run_co2_workflow(args, system_name: str):
     source_pdb = args.co2_source_pdb.resolve()
     co2_pdb = find_co2_pdb(args.co2_pdb)
@@ -5015,7 +5995,7 @@ def run_co2_workflow(args, system_name: str):
         source_pdb, args.co2_solute_atoms, expected_solute_pdb
     )
     template_metadata = validate_co2_template(co2_pdb)
-    if shutil.which(args.packmol) is None:
+    if args.co2_start_stage is None and shutil.which(args.packmol) is None:
         raise RuntimeError(
             f"Packmol executable '{args.packmol}' not found in PATH. "
             "Use --packmol /path/to/packmol if needed."
@@ -5037,39 +6017,86 @@ def run_co2_workflow(args, system_name: str):
         f"{args.co2_shell_outer:.3f} A"
     )
     print(CO2_WORKFLOW_NOTE)
+    resources = co2_execution_resources(args)
+    print(f"CO2 concurrent jobs     : {resources['co2_parallel_jobs']}")
+    print(f"xTB threads per job     : {resources['xtb_threads_per_job']}")
+    print(f"maximum requested CPUs  : {resources['maximum_requested_cpus']}")
+    if resources["oversubscription_warning"]:
+        print(
+            "WARNING: CO2 parallel jobs x threads exceeds os.cpu_count() "
+            f"({resources['detected_cpu_count']}). Execution will continue "
+            "because HPC affinity/allocation may differ."
+        )
 
+    condition_specs = [
+        {
+            "co2_count": co2_count,
+            "pack_index": pack_index,
+            "condition_dir": co2_condition_dir(
+                args.co2_project.resolve(),
+                system_name,
+                co2_count,
+                pack_index,
+            ),
+        }
+        for co2_count in sorted(args.co2_counts)
+        for pack_index in range(1, args.co2_pack_replicas + 1)
+    ]
+    failures = []
     try:
-        for co2_count in sorted(args.co2_counts):
-            for pack_index in range(1, args.co2_pack_replicas + 1):
-                condition_dir = co2_condition_dir(
-                    args.co2_project.resolve(),
-                    system_name,
-                    co2_count,
-                    pack_index,
-                )
-                packing_manifest = run_co2_pack_stage(
-                    condition_dir,
+        if args.co2_parallel_jobs == 1:
+            for spec in condition_specs:
+                run_co2_condition(
+                    spec,
                     system_name,
                     source_pdb,
                     co2_pdb,
                     source_metadata,
                     template_metadata,
-                    co2_count,
-                    pack_index,
                     args,
                 )
-                rebuild_co2_summaries(system_dir)
-                if args.run:
-                    run_co2_accommodation_stage(
-                        condition_dir,
-                        packing_manifest,
+        else:
+            with ThreadPoolExecutor(
+                max_workers=args.co2_parallel_jobs,
+                thread_name_prefix="co2-condition",
+            ) as executor:
+                future_to_spec = {
+                    executor.submit(
+                        run_co2_condition,
+                        spec,
+                        system_name,
+                        source_pdb,
+                        co2_pdb,
                         source_metadata,
                         template_metadata,
                         args,
-                    )
-                    rebuild_co2_summaries(system_dir)
+                    ): spec
+                    for spec in condition_specs
+                }
+                for future in as_completed(future_to_spec):
+                    spec = future_to_spec[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        label = (
+                            f"NCO2_{spec['co2_count']:02d}/"
+                            f"pack_{spec['pack_index']:02d}"
+                        )
+                        failures.append((label, exc))
+                        print(f"  FAILED {label}: {exc}")
     finally:
         rebuild_co2_summaries(system_dir)
+        rebuild_co2_md_summary(system_dir)
+        print_co2_workflow_status(system_dir, condition_specs, args)
+
+    if failures:
+        detail = "; ".join(
+            f"{label}: {error}" for label, error in failures
+        )
+        raise RuntimeError(
+            f"{len(failures)} independent CO2 condition(s) failed after "
+            f"all submitted workers finished: {detail}"
+        )
 
     if not args.run:
         print(
@@ -5077,6 +6104,10 @@ def run_co2_workflow(args, system_name: str):
             "system_CO2_centered.pdb and packing_summary.tsv before running "
             "the xTB accommodation with the same command plus --run."
         )
+    elif args.co2_extended:
+        print("CO2 workflow finished through 10_CO2_298K_extended.")
+    elif args.co2_md:
+        print("CO2 workflow finished through 09_CO2_298K_screen.")
     else:
         print("CO2 shell packing and structural accommodation finished.")
 
@@ -5349,13 +6380,13 @@ def parse_args():
 
     co2 = p.add_argument_group(
         "independent CO2 shell screening",
-        "Build new full-droplet + CO2 conditions and optionally optimize "
-        "mobile water/CO2; this is not an MD continuation.",
+        "Build full-droplet + CO2 conditions, optimize mobile water/CO2, "
+        "and optionally run their independent 298 K MD branches.",
     )
     co2.add_argument(
         "--co2-shell-screen",
         action="store_true",
-        help="Activate the independent 06/07 CO2 shell-screen workflow.",
+        help="Activate the independent CO2 workflow (06 onward).",
     )
     co2.add_argument(
         "--co2-source-pdb",
@@ -5440,6 +6471,58 @@ def parse_args():
         default="auto",
         choices=["auto", "rf", "lbfgs", "inertial"],
         help="CO2 accommodation optimizer; inertial selects xTB FIRE (default: auto).",
+    )
+    co2.add_argument(
+        "--co2-md",
+        action="store_true",
+        help="After 06/07, run 08 equilibration and 09 CO2 screening MD.",
+    )
+    co2.add_argument(
+        "--co2-extended",
+        action="store_true",
+        help="Also run the direct 10_CO2_298K_extended continuation.",
+    )
+    co2.add_argument(
+        "--co2-equil-time-ps",
+        type=float,
+        default=1.0,
+        help="Stage-08 equilibration duration in ps (default: 1.0).",
+    )
+    co2.add_argument(
+        "--co2-screen-time-ps",
+        type=float,
+        default=5.0,
+        help="Stage-09 production/screening duration in ps (default: 5.0).",
+    )
+    co2.add_argument(
+        "--co2-extended-time-ps",
+        type=float,
+        default=20.0,
+        help="Stage-10 additional production duration in ps (default: 20.0).",
+    )
+    co2.add_argument(
+        "--co2-equil-dump-fs",
+        type=float,
+        default=10.0,
+        help="Stage-08 trajectory dump interval in fs (default: 10.0).",
+    )
+    co2.add_argument(
+        "--co2-production-dump-fs",
+        type=float,
+        default=2.0,
+        help="Stage-09/10 trajectory dump interval in fs (default: 2.0).",
+    )
+    co2.add_argument(
+        "--co2-parallel-jobs",
+        type=int,
+        default=1,
+        help="Maximum independent CO2 condition pipelines in parallel (default: 1).",
+    )
+    co2.add_argument(
+        "--co2-start-stage",
+        choices=CO2_START_STAGE_CHOICES,
+        default=None,
+        help="Validate predecessors and begin/reuse the selected CO2 stage.",
     )
 
     return p.parse_args()
@@ -5544,6 +6627,60 @@ def validate_args(args):
             )
         if args.co2_accommodation_cycles < 1:
             raise SystemExit("--co2-accommodation-cycles must be >= 1.")
+        for option, value in (
+            ("--co2-equil-time-ps", args.co2_equil_time_ps),
+            ("--co2-screen-time-ps", args.co2_screen_time_ps),
+            ("--co2-extended-time-ps", args.co2_extended_time_ps),
+            ("--co2-equil-dump-fs", args.co2_equil_dump_fs),
+            ("--co2-production-dump-fs", args.co2_production_dump_fs),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise SystemExit(f"{option} must be > 0.")
+        if args.co2_parallel_jobs < 1:
+            raise SystemExit("--co2-parallel-jobs must be >= 1.")
+        if args.co2_md and not args.run:
+            raise SystemExit("--co2-md requires --run.")
+        if args.co2_extended and not args.co2_md:
+            raise SystemExit("--co2-extended requires --co2-md.")
+        if args.co2_extended and not args.run:
+            raise SystemExit("--co2-extended requires --run.")
+        if args.co2_start_stage is not None and not args.run:
+            raise SystemExit("--co2-start-stage requires --run.")
+        if (
+            args.co2_start_stage in CO2_MD_STAGE_NAMES
+            and not args.co2_md
+        ):
+            raise SystemExit(
+                "CO2 start stages 08-10 require --co2-md."
+            )
+        if (
+            args.co2_start_stage == CO2_EXTENDED_STAGE
+            and not args.co2_extended
+        ):
+            raise SystemExit(
+                f"--co2-start-stage {CO2_EXTENDED_STAGE} requires "
+                "--co2-extended."
+            )
+        if args.co2_start_stage is not None and args.co2_repack:
+            raise SystemExit(
+                "--co2-start-stage cannot be combined with --co2-repack; "
+                "the existing packing is a required predecessor."
+            )
+        try:
+            stages = co2_md_stages(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        for stage in stages:
+            exact_dump_steps = stage["dump_fs"] / MD_STEP_FS
+            if not math.isclose(
+                exact_dump_steps,
+                round(exact_dump_steps),
+                abs_tol=1.0e-9,
+            ):
+                raise SystemExit(
+                    f"{stage['name']} dump interval ({stage['dump_fs']} fs) "
+                    f"is not an integral number of {MD_STEP_FS} fs steps."
+                )
         if args.force and not args.run:
             raise SystemExit(
                 "In CO2 mode, --force reruns 07_CO2_accommodation and "
@@ -5580,6 +6717,15 @@ def validate_args(args):
         or args.co2_accommodation_level != "loose"
         or args.co2_accommodation_cycles != 30
         or args.co2_accommodation_engine != "auto"
+        or args.co2_md
+        or args.co2_extended
+        or args.co2_equil_time_ps != 1.0
+        or args.co2_screen_time_ps != 5.0
+        or args.co2_extended_time_ps != 20.0
+        or args.co2_equil_dump_fs != 10.0
+        or args.co2_production_dump_fs != 2.0
+        or args.co2_parallel_jobs != 1
+        or args.co2_start_stage is not None
     ):
         raise SystemExit(
             "CO2-specific source/count/repack options require "

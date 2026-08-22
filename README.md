@@ -202,9 +202,10 @@ velocities, composition, hashes, and a conservative free-disk estimate.
 `--co2-shell-screen` activates a separate workflow that starts from one
 representative **full-droplet** PDB (Zn(His)2 plus all explicit waters), adds
 neutral CO2 molecules around Zn with Packmol, and can then optimize only the
-water and CO2 atoms with xTB. It is a new structural condition: it does not use
-`mdrestart`, preserve velocities, or dynamically continue stage 05. The two CO2
-stage names are deliberately not members of the aqueous `STAGES` sequence.
+water and CO2 atoms with xTB. It is a new structural condition: it never uses
+the aqueous `mdrestart` or velocities and does not dynamically continue stage
+05. Optional stages 08--10 start a new 298 K dynamic branch after accommodation.
+No CO2 stage is a member of the aqueous `STAGES` sequence.
 
 The source must retain the pipeline atom layout: the first 39 atoms are the
 biomimetic by default, followed by complete three-atom water groups. The code
@@ -267,12 +268,63 @@ leave the initial shell during optimization without making the result invalid.
 Initial/final Zn--C and water-O--CO2-C distances, conservatively parsed energies,
 and convergence status are recorded without automatic chemical interpretation.
 
+Add `--co2-md` to run the new 298 K dynamics through stage 09, or add both
+`--co2-md --co2-extended` to include stage 10:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --system T4_cristal \
+    --co2-shell-screen \
+    --co2-source-pdb medoids/T4_cristal_full_medoid.pdb \
+    --co2-pdb co2.pdb \
+    --co2-counts 1 2 4 8 \
+    --co2-pack-replicas 3 \
+    --co2-project co2_screening \
+    --packmol /path/to/packmol \
+    --xtb /path/to/xtb \
+    --threads 16 \
+    --co2-parallel-jobs 3 \
+    --run --co2-md --co2-extended
+```
+
+The default independent CO2 MD protocol is:
+
+```text
+07_CO2_accommodation/system_CO2_accommodated.pdb
+  -> 08_CO2_298K_equil     1 ps, dump 10 fs, restart=false, new velocities
+  -> 09_CO2_298K_screen    5 ps, dump  2 fs, restart=true from 08
+  -> 10_CO2_298K_extended 20 ps, dump  2 fs, restart=true from 09 (opt-in)
+```
+
+All three stages use `dt=0.5 fs`, NVT at 298.15 K, physical hydrogen masses,
+SHAKE off, velocity output, the unchanged CO2-system wall, and the exact
+accommodated composition. Stage 08 deliberately initializes new velocities;
+09 and 10 copy and hash the validated predecessor `mdrestart`, preserving both
+coordinates and velocities. Thus the default production time is 5 ps through
+09 and 25 ps through 10, while the separate 1 ps stage 08 remains
+equilibration—not part of the stated production duration.
+
+The 2 fs production dump retains the original velocity-containing `xtb.trj`
+for later VACF/power-spectrum/VDOS work. Manifests record the sampling
+frequency and Nyquist wavenumber. `spectroscopy_sampling_ready=true` means only
+that temporal sampling is suitable for subsequent vibrational power-spectrum /
+VDOS analysis; it does not claim that an IR spectrum was calculated.
+
+`--co2-parallel-jobs N` runs at most N independent `NCO2/pack_XX` branches at
+once. Stages inside one branch always remain sequential. Each xTB subprocess
+still receives `--threads` through `OMP_NUM_THREADS` and `MKL_NUM_THREADS`, so
+the approximate maximum request is `N * threads`; exceeding `os.cpu_count()`
+emits a visible warning but remains allowed for scheduler/HPC environments.
+Workers write only their stage directories. The main thread rebuilds all TSV
+summaries after workers finish, avoiding concurrent summary writes.
+
 The deterministic output layout is:
 
 ```text
 co2_screening/<SYSTEM>/
 ├── packing_summary.tsv
 ├── accommodation_summary.tsv
+├── co2_md_summary.tsv
 └── NCO2_XX/
     └── pack_XX/
         ├── 06_CO2_shell_pack/
@@ -285,14 +337,26 @@ co2_screening/<SYSTEM>/
         │   ├── system_CO2_centered.pdb
         │   ├── stage_manifest.json
         │   └── stage.done
-        └── 07_CO2_accommodation/
-            ├── system_CO2_centered.pdb
-            ├── 07_CO2_accommodation.inp
-            ├── 07_CO2_accommodation.out
+        ├── 07_CO2_accommodation/
+        │   ├── system_CO2_centered.pdb
+        │   ├── 07_CO2_accommodation.inp
+        │   ├── 07_CO2_accommodation.out
+        │   ├── system_CO2_accommodated.pdb
+        │   ├── stage_manifest.json
+        │   ├── stage.done
+        │   └── xTB output files when generated
+        ├── 08_CO2_298K_equil/
+        ├── 09_CO2_298K_screen/
+        └── 10_CO2_298K_extended/
             ├── system_CO2_accommodated.pdb
+            ├── <STAGE>.inp
+            ├── <STAGE>.out
+            ├── xtb.trj
+            ├── mdrestart
+            ├── mdrestart.input   # only 09/10
+            ├── xtbmdok
             ├── stage_manifest.json
-            ├── stage.done
-            └── xTB output files when generated
+            └── stage.done
 ```
 
 Compatible completed stages print `REUSE`. A changed source hash, CO2 template,
@@ -302,6 +366,14 @@ use `--force --run` to archive and replace stage 07. Changing only `--threads`
 does not invalidate a completed scientific result; the count remains execution
 provenance. The TSV files are rebuilt from manifests in count/packing order, so
 rerunning the command does not append duplicate rows.
+
+Use `--co2-start-stage` with `07_CO2_accommodation`,
+`08_CO2_298K_equil`, `09_CO2_298K_screen`, or `10_CO2_298K_extended` to
+validate the complete predecessor chain and begin at that stage. Stages 08--10
+require `--co2-md`, and stage 10 also requires `--co2-extended`. With
+`--force`, the selected stage and requested descendants are archived under
+`attempts/` before rerunning. A changed 07 geometry, 08 restart, or 09 restart
+invalidates the corresponding descendants by SHA256.
 
 The workflow is:
 
