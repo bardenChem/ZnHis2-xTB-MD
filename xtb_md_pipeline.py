@@ -206,6 +206,9 @@ CO2_WATER_REPLACEMENT_NOTE = (
     "The placement restraint is used only during initial Packmol generation "
     "and does not persist during xTB accommodation or MD."
 )
+CO2_ELEMENT_CASE_VALIDATION_ERROR = (
+    "first-frame element order differs from the input geometry"
+)
 PDB_COORDINATE_TOLERANCE_A = 0.002
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
 
@@ -234,6 +237,26 @@ FATAL_XTB_PATTERNS = [
 # ---------------------------------------------------------------------------
 # PDB helpers
 # ---------------------------------------------------------------------------
+
+def _normalize_element_symbol(value: str) -> str:
+    """Return a supported chemical symbol in canonical capitalization."""
+    stripped = value.strip()
+    if not stripped:
+        raise RuntimeError("Empty element symbol.")
+    if not stripped.isalpha():
+        raise RuntimeError(
+            f"Invalid element symbol {value!r}: expected letters only."
+        )
+
+    normalized = stripped[0].upper() + stripped[1:].lower()
+    if normalized not in ATOMIC_MASSES:
+        supported = ", ".join(ATOMIC_MASSES)
+        raise RuntimeError(
+            f"Unsupported element symbol {value!r} (normalized as "
+            f"{normalized!r}); supported elements: {supported}."
+        )
+    return normalized
+
 
 def infer_element(line: str) -> str:
     """Infer element from a PDB ATOM/HETATM line."""
@@ -2204,6 +2227,19 @@ def validate_xtb_trajectory(
     if path.stat().st_size == 0:
         raise RuntimeError(f"empty trajectory: {path}")
 
+    expected_element_order = None
+    if expected_elements is not None:
+        expected_element_order = tuple(
+            _normalize_element_symbol(element)
+            for element in expected_elements
+        )
+        if len(expected_element_order) != expected_atoms:
+            raise RuntimeError(
+                "Expected element sequence has "
+                f"{len(expected_element_order)} atoms, expected "
+                f"{expected_atoms}."
+            )
+
     frame_count = 0
     element_order = None
     with path.open("r", errors="replace") as handle:
@@ -2257,13 +2293,21 @@ def validate_xtb_trajectory(
                         f"{frame_count + 1}, coordinate {atom_index}"
                     ),
                 )
-                frame_elements.append(fields[0])
+                try:
+                    frame_elements.append(
+                        _normalize_element_symbol(fields[0])
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"Invalid trajectory {path}, frame "
+                        f"{frame_count + 1}, coordinate {atom_index}: {exc}"
+                    ) from exc
 
             if element_order is None:
                 element_order = tuple(frame_elements)
                 if (
-                    expected_elements is not None
-                    and element_order != tuple(expected_elements)
+                    expected_element_order is not None
+                    and element_order != expected_element_order
                 ):
                     raise RuntimeError(
                         f"Invalid trajectory {path}: first-frame element "
@@ -6261,6 +6305,272 @@ def _co2_md_required_outputs(stage: dict) -> list[str]:
     return required
 
 
+def recover_co2_element_case_validation_failure(
+    condition_dir: Path,
+    stage: dict,
+    expected_configuration: dict,
+    expected_elements: list[str],
+    args,
+) -> dict | None:
+    """Promote only the stage-08 element-capitalization false positive."""
+    stage_dir = condition_dir / stage["name"]
+    failed = stage_dir / "stage.failed"
+    if not failed.is_file() or stage["name"] != CO2_EQUIL_STAGE:
+        return None
+
+    if (stage_dir / "stage.done").exists():
+        raise RuntimeError(
+            f"Cannot recover {stage['name']}: stage.done and stage.failed "
+            "both exist."
+        )
+    if (stage_dir / "stage.running").exists():
+        raise RuntimeError(
+            f"Cannot recover {stage['name']}: stage.running conflicts with "
+            "stage.failed."
+        )
+
+    manifest = _read_json_dict(
+        stage_dir / "stage_manifest.json", "failed CO2 MD stage manifest"
+    )
+    if manifest.get("status") != "failed":
+        raise RuntimeError(
+            f"Cannot recover {stage['name']}: stage.failed conflicts with "
+            f"manifest status {manifest.get('status')!r}."
+        )
+    original_failure_reason = manifest.get("failure_reason")
+    if (
+        not isinstance(original_failure_reason, str)
+        or CO2_ELEMENT_CASE_VALIDATION_ERROR not in original_failure_reason
+    ):
+        return None
+
+    marker_reason = failed.read_text(errors="replace").strip()
+    if marker_reason != original_failure_reason:
+        raise RuntimeError(
+            f"Cannot recover {stage['name']}: stage.failed reason differs "
+            "from stage_manifest.json."
+        )
+
+    try:
+        recorded_configuration = manifest.get("configuration")
+        if not isinstance(recorded_configuration, dict):
+            raise RuntimeError("failed manifest has no configuration object")
+        mismatches = configuration_mismatches(
+            expected_configuration, recorded_configuration
+        )
+        flattened_mismatches = configuration_mismatches(
+            expected_configuration, manifest
+        )
+        all_mismatches = list(dict.fromkeys(
+            [*mismatches, *flattened_mismatches]
+        ))
+        if all_mismatches:
+            raise RuntimeError(
+                "archived configuration is incompatible with the current "
+                f"CO2 MD protocol (fields: {', '.join(all_mismatches)})"
+            )
+        # Historical CO2 failure manifests did not persist returncode. This
+        # exact trajectory-validation error was reachable only after the
+        # explicit nonzero-returncode branch had been passed.
+        if manifest.get("returncode") not in (None, 0):
+            raise RuntimeError(
+                f"failed manifest records xTB return code "
+                f"{manifest.get('returncode')!r}"
+            )
+
+        required = [
+            f"{stage['name']}.inp",
+            f"{stage['name']}.out",
+            "system_CO2_accommodated.pdb",
+            "xtb.trj",
+            "mdrestart",
+            "xtbmdok",
+        ]
+        if stage["restart"]:
+            required.append("mdrestart.input")
+        missing = [
+            name for name in required if not (stage_dir / name).is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                "archived outputs are incomplete (missing: "
+                + ", ".join(missing)
+                + ")"
+            )
+        recorded_output_hashes = manifest.get("output_sha256")
+        if not isinstance(recorded_output_hashes, dict):
+            raise RuntimeError("failed manifest has no output SHA-256 map")
+        missing_hashes = [
+            name for name in required if name not in recorded_output_hashes
+        ]
+        if missing_hashes:
+            raise RuntimeError(
+                "failed manifest lacks hashes for required output(s): "
+                + ", ".join(missing_hashes)
+            )
+        _validate_co2_output_hashes(stage_dir, manifest)
+
+        geometry = stage_dir / "system_CO2_accommodated.pdb"
+        if file_sha256(geometry) != expected_configuration[
+            "input_geometry_sha256"
+        ]:
+            raise RuntimeError("input geometry hash is incompatible")
+        geometry_atoms = _validated_pdb_atoms(
+            geometry, "CO2 MD recovery input geometry"
+        )
+        if len(geometry_atoms) != expected_configuration["n_atoms"]:
+            raise RuntimeError(
+                f"input geometry has {len(geometry_atoms)} atoms, expected "
+                f"{expected_configuration['n_atoms']}"
+            )
+        expected_element_order = tuple(
+            _normalize_element_symbol(element)
+            for element in expected_elements
+        )
+        geometry_element_order = tuple(
+            _normalize_element_symbol(element)
+            for element in _element_sequence(geometry_atoms)
+        )
+        if geometry_element_order != expected_element_order:
+            raise RuntimeError(
+                "input geometry element order differs from the validated "
+                "accommodation geometry"
+            )
+
+        input_path = stage_dir / f"{stage['name']}.inp"
+        expected_input = co2_md_input(
+            stage, expected_configuration["wall_radius_bohr"]
+        )
+        if input_path.read_text() != expected_input:
+            raise RuntimeError("archived xTB input content is incompatible")
+
+        input_restart_sha256 = expected_configuration[
+            "input_restart_sha256"
+        ]
+        if stage["restart"]:
+            input_restart = stage_dir / "mdrestart.input"
+            parse_mdrestart(
+                input_restart, expected_configuration["n_atoms"]
+            )
+            if file_sha256(input_restart) != input_restart_sha256:
+                raise RuntimeError(
+                    "mdrestart.input does not match the validated "
+                    "predecessor restart"
+                )
+        elif (stage_dir / "mdrestart.input").exists():
+            raise RuntimeError(
+                "restart=false stage contains an unexpected mdrestart.input"
+            )
+
+        output_restart_sha256 = validate_output_restart(
+            stage_dir / "mdrestart",
+            input_restart_sha256,
+            expected_atoms=expected_configuration["n_atoms"],
+        )
+        trajectory = validate_xtb_trajectory(
+            stage_dir / "xtb.trj",
+            expected_atoms=expected_configuration["n_atoms"],
+            expected_frames=stage["expected_frames"],
+            require_velocities=True,
+            expected_elements=expected_elements,
+        )
+
+        log_path = stage_dir / f"{stage['name']}.out"
+        log_validation = inspect_md_log(log_path)
+        if log_validation["fatal_patterns"]:
+            raise RuntimeError(
+                "archived log contains fatal pattern(s): "
+                + ", ".join(log_validation["fatal_patterns"])
+            )
+        warning_accepted = (
+            log_validation["thermostating_problem"]
+            and log_validation["normal_exit_of_md"]
+            and thermostat_warning_allowed(
+                args.thermostat_warning_policy, stage["name"]
+            )
+        )
+        if log_validation["thermostating_problem"] and not warning_accepted:
+            raise RuntimeError(
+                "archived log has an unaccepted thermostating problem"
+            )
+        thermal_result = md_thermal_result(
+            stage,
+            log_validation,
+            args.thermostat_warning_policy,
+            warning_accepted,
+        )
+        xtb_version = extract_xtb_version(
+            log_path, stage_dir / "xtb.trj"
+        )
+        if xtb_version is None:
+            raise RuntimeError(
+                "xTB version could not be determined from the archived "
+                "log/trajectory"
+            )
+
+        trajectory = dict(trajectory)
+        trajectory["path"] = "xtb.trj"
+        recovery = {
+            "promoted_from_stage_failed": True,
+            "original_failure_reason": original_failure_reason,
+            "original_failed_at": manifest.get("finished_at"),
+            "xtb_recalculated": False,
+            "reason": (
+                "trajectory element symbols were compared case-sensitively; "
+                "xTB wrote ZN while PDB parsing normalized the element as Zn"
+            ),
+            "validator_fix": (
+                "element symbols normalized before trajectory-order "
+                "comparison"
+            ),
+            "returncode_evidence": (
+                "recorded returncode == 0"
+                if manifest.get("returncode") == 0
+                else (
+                    "the historical element-order validation failure was "
+                    "reachable only after xTB returncode == 0"
+                )
+            ),
+        }
+        completed = dict(manifest)
+        completed.update(expected_configuration)
+        completed.update({
+            "workflow": "CO2_shell_screening_MD",
+            "stage": stage["name"],
+            "status": "completed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": 0,
+            "xtb_version": xtb_version,
+            "configuration": dict(expected_configuration),
+            "input_restart_path": (
+                "mdrestart.input" if stage["restart"] else None
+            ),
+            "output_restart_sha256": output_restart_sha256,
+            "trajectory_integrity": trajectory,
+            "thermal_result": thermal_result,
+            "composition_changed_relative_to_aqueous": True,
+            "solvation_rebuilt": False,
+            "geometry_reoptimized": False,
+            "coordinates_recentered": False,
+            "recovery": recovery,
+            "output_sha256": _co2_stage_output_hashes(stage_dir),
+        })
+        completed.pop("failure_reason", None)
+        _write_json(stage_dir / "stage_manifest.json", completed)
+        mark_stage_done(stage_dir)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot recover {stage['name']}: {exc}. stage.failed was "
+            "retained and xTB was not run."
+        ) from exc
+
+    print(f"  RECOVER {stage['name']}:")
+    print("       trajectory element capitalization false positive;")
+    print("       existing xTB outputs passed full integrity validation;")
+    print("       no xTB recalculation performed.")
+    return completed
+
+
 def validate_completed_co2_md_stage(
     condition_dir: Path,
     stage: dict,
@@ -6452,6 +6762,17 @@ def run_co2_md_stage(
             f"{stage['name']} composition mismatch: accommodation has "
             f"{len(expected_atoms)} atoms, expected {configuration['n_atoms']}."
         )
+
+    if not force:
+        recovered = recover_co2_element_case_validation_failure(
+            condition_dir,
+            stage,
+            configuration,
+            expected_elements,
+            args,
+        )
+        if recovered is not None:
+            return recovered
 
     if (stage_dir / "stage.done").is_file() and not force:
         manifest = validate_completed_co2_md_stage(
