@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -52,6 +53,7 @@ import sys
 from typing import Iterable
 
 BOHR_PER_ANGSTROM = 1.8897261254578281
+HARTREE_TO_KCAL_MOL = 627.5094740631
 AVOGADRO = 6.02214076e23
 WATER_MOLAR_MASS = 18.01528  # g/mol
 MD_STEP_FS = 0.5
@@ -7647,6 +7649,888 @@ def run_co2_workflow(args, system_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Independent relaxed reaction-coordinate scan (not an MD stage)
+# ---------------------------------------------------------------------------
+
+SCAN_WORKFLOW_NOTE = (
+    "This is a relaxed constrained potential-energy scan. It is not a "
+    "free-energy calculation, ΔG‡, kinetic barrier, converged reaction path, "
+    "transition-state search, or minimum-energy path."
+)
+SCAN_WATER_RESNAMES = frozenset({"HOH", "WAT", "SOL", "TIP3", "TIP3P", "H2O"})
+SCAN_FIXED_TOLERANCE_A = 0.002
+SCAN_FATAL_PATTERNS = (*FATAL_XTB_PATTERNS, "#ERROR!", "ERROR STOP")
+
+
+@dataclass(frozen=True)
+class ScanCoordinate:
+    atom_i: int
+    atom_j: int
+    requested_start: str | float
+    resolved_start_A: float
+    end_A: float
+    n_points: int
+
+
+def distance_A(first, second) -> float:
+    return math.dist(first, second)
+
+
+def validate_scan_source(path: Path):
+    if not path.is_file():
+        raise ValueError(f"Scan source XYZ not found: {path}")
+    elements, xyz = read_xyz_geometry(path)
+    if len(elements) < 2:
+        raise ValueError("Scan source must contain at least two atoms.")
+    lines = path.read_text(errors="replace").splitlines()
+    if any(len(line.split()) != 4 for line in lines[2:len(elements) + 2]):
+        raise ValueError(f"Scan source XYZ has nonstandard atom records: {path}.")
+    if any(line.strip() for line in lines[len(elements) + 2:]):
+        raise ValueError("Scan source must contain exactly one XYZ frame.")
+    normalized = [_normalize_element_symbol(element) for element in elements]
+    if any(not math.isfinite(value) for point in xyz for value in point):
+        raise ValueError(f"Non-finite XYZ coordinate in {path}.")
+    return normalized, xyz
+
+
+def parse_scan_coordinate(spec: str, xyz) -> ScanCoordinate:
+    fields = spec.split(":")
+    if len(fields) != 5 or fields[0].lower() != "distance":
+        raise ValueError("V1 --scan-coordinate requires distance:I,J:START:END:N.")
+    try:
+        pair = fields[1].split(",")
+        if len(pair) != 2:
+            raise ValueError
+        atom_i, atom_j = (int(value) for value in pair)
+        end_A = float(fields[3])
+        n_points = int(fields[4])
+        requested_start = (
+            "auto" if fields[2].lower() == "auto" else float(fields[2])
+        )
+    except ValueError as exc:
+        raise ValueError("Invalid distance scan specification.") from exc
+    if atom_i < 1 or atom_j < 1 or atom_i > len(xyz) or atom_j > len(xyz):
+        raise ValueError(f"Reaction atom indices must be in 1-{len(xyz)}.")
+    if atom_i == atom_j:
+        raise ValueError("Reaction coordinate requires two distinct atoms.")
+    start_A = (
+        distance_A(xyz[atom_i - 1], xyz[atom_j - 1])
+        if requested_start == "auto" else requested_start
+    )
+    if not math.isfinite(start_A) or start_A <= 0:
+        raise ValueError("Scan START must be finite and > 0 Å.")
+    if not math.isfinite(end_A) or end_A <= 0:
+        raise ValueError("Scan END must be finite and > 0 Å.")
+    if n_points < 2:
+        raise ValueError("Scan N must be >= 2.")
+    return ScanCoordinate(atom_i, atom_j, requested_start, start_A, end_A, n_points)
+
+
+def parse_atom_ranges(spec: str | None, n_atoms: int) -> list[int]:
+    if spec is None:
+        return []
+    if not spec.strip():
+        raise ValueError("Fixed-atom range specification is empty.")
+    selected = set()
+    for token in spec.split(","):
+        match = re.fullmatch(r"\s*(\d+)(?:\s*-\s*(\d+))?\s*", token)
+        if not match:
+            raise ValueError(f"Invalid fixed-atom range {token!r}.")
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if first < 1 or last < first or last > n_atoms:
+            raise ValueError(f"Fixed-atom range {token!r} must lie in 1-{n_atoms}.")
+        selected.update(range(first, last + 1))
+    return sorted(selected)
+
+
+def compress_atom_ranges(indices: Iterable[int]) -> str:
+    values = sorted(set(indices))
+    spans = []
+    for value in values:
+        if spans and value == spans[-1][1] + 1:
+            spans[-1][1] = value
+        else:
+            spans.append([value, value])
+    return ",".join(
+        str(first) if first == last else f"{first}-{last}"
+        for first, last in spans
+    )
+
+
+def validate_scan_topology(path: Path, elements: list[str]):
+    if not path.is_file():
+        raise ValueError(f"Scan topology PDB not found: {path}")
+    lines = path.read_text().splitlines(keepends=True)
+    atoms = read_pdb_atoms(lines)
+    if len(atoms) != len(elements):
+        raise ValueError(
+            f"Topology has {len(atoms)} atoms; XYZ has {len(elements)}."
+        )
+    if [atom["element"] for atom in atoms] != elements:
+        raise ValueError("Topology and XYZ element sequences differ; no reordering is attempted.")
+    return lines, atoms
+
+
+def scan_fixed_atoms_from_mobile_radius(
+    topology_lines, topology_atoms, xyz, center_index: int, radius_A: float
+):
+    waters = {}
+    for index, atom in enumerate(topology_atoms, 1):
+        line = topology_lines[atom["line_index"]]
+        resname = line[17:20].strip().upper()
+        extended = line[17:22].strip().upper()
+        if extended.startswith("TIP3P"):
+            resname = "TIP3P"
+        elif extended.startswith("TIP3"):
+            resname = "TIP3"
+        if resname not in SCAN_WATER_RESNAMES:
+            continue
+        key = (line[21:22], line[22:26], line[26:27], resname)
+        waters.setdefault(key, []).append(index)
+    fixed, n_fixed, n_mobile = set(), 0, 0
+    for indices in waters.values():
+        oxygen = [index for index in indices if topology_atoms[index - 1]["element"] == "O"]
+        if len(oxygen) != 1 or len(indices) != 3 or sum(
+            topology_atoms[index - 1]["element"] == "H" for index in indices
+        ) != 2:
+            raise ValueError(
+                f"Water residue containing atom {indices[0]} is not one O plus two H; "
+                "refusing partial-water fixation."
+            )
+        if distance_A(xyz[oxygen[0] - 1], xyz[center_index - 1]) > radius_A:
+            fixed.update(indices)
+            n_fixed += 1
+        else:
+            n_mobile += 1
+    return sorted(fixed), n_fixed, n_mobile
+
+
+def prepare_scan_geometry(elements, xyz, wall_auto: bool, margin_A: float):
+    wall = {
+        "enabled": wall_auto, "margin_A": margin_A,
+        "original_COM_A": None, "translation_A": None,
+        "max_radius_A": None, "radius_A": None, "radius_bohr": None,
+    }
+    if not wall_auto:
+        return list(xyz), wall
+    masses = [ATOMIC_MASSES[element] for element in elements]
+    total = sum(masses)
+    com = [sum(mass * point[axis] for mass, point in zip(masses, xyz)) / total
+           for axis in range(3)]
+    translation = [-value for value in com]
+    prepared = [tuple(point[axis] + translation[axis] for axis in range(3))
+                for point in xyz]
+    rmax = max(math.dist((0.0, 0.0, 0.0), point) for point in prepared)
+    radius_A = rmax + margin_A
+    wall.update({
+        "original_COM_A": com, "translation_A": translation,
+        "max_radius_A": rmax, "radius_A": radius_A,
+        "radius_bohr": radius_A * BOHR_PER_ANGSTROM,
+    })
+    return prepared, wall
+
+
+def write_scan_xyz(path: Path, elements, xyz, comment: str):
+    lines = [str(len(elements)), comment]
+    lines.extend(
+        f"{element:<2} {x:.12f} {y:.12f} {z:.12f}"
+        for element, (x, y, z) in zip(elements, xyz)
+    )
+    path.write_text("\n".join(lines) + "\n")
+
+
+def scan_xcontrol(coordinate: ScanCoordinate, force_constant: float,
+                  fixed_atoms, wall: dict, engine: str, *, scan: bool) -> str:
+    lines = [
+        "$constrain", f"   force constant={force_constant:.12g}",
+        f"   distance: {coordinate.atom_i},{coordinate.atom_j},"
+        f"{coordinate.resolved_start_A:.12f}", "$end",
+    ]
+    if scan:
+        lines.extend([
+            "$scan",
+            f"   1: {coordinate.resolved_start_A:.12f},"
+            f"{coordinate.end_A:.12f},{coordinate.n_points}", "$end",
+        ])
+    if fixed_atoms:
+        lines.extend(["$fix", f"   atoms: {compress_atom_ranges(fixed_atoms)}", "$end"])
+    if wall["enabled"]:
+        lines.extend([
+            "$wall", "   potential=logfermi",
+            f"   sphere: {wall['radius_bohr']:.12f}, all", "$end",
+        ])
+    if engine != "auto":
+        lines.extend(["$opt", f"   engine={engine}", "$end"])
+    return "\n".join(lines) + "\n"
+
+
+def scan_condition_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._-")
+    if not name or name in {".", ".."}:
+        raise ValueError("--scan-label must contain a safe directory-name character.")
+    return name
+
+
+def scan_output_hashes(stage_dir: Path, names: Iterable[str]) -> dict:
+    return {name: file_sha256(stage_dir / name) for name in names}
+
+
+def scan_active_file_hashes(stage_dir: Path) -> dict:
+    excluded = {"stage_manifest.json", "stage.running", "stage.done", "stage.failed"}
+    return {
+        str(path.relative_to(stage_dir)): file_sha256(path)
+        for path in sorted(stage_dir.rglob("*"))
+        if path.is_file() and "attempts" not in path.relative_to(stage_dir).parts
+        and path.name not in excluded
+    }
+
+
+def ensure_scan_input(path: Path, content: bytes):
+    """Keep inspected preparation inputs intact unless explicitly archived."""
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != content:
+            raise RuntimeError(f"Prepared scan input differs: {path}; use --force.")
+    else:
+        path.write_bytes(content)
+
+
+def validate_existing_scan_input(path: Path, content: bytes):
+    if not path.is_file() or path.read_bytes() != content:
+        raise RuntimeError(f"Existing scan input differs or is missing: {path}; use --force.")
+
+
+def validate_scan_stage_reuse(stage_dir: Path, configuration: dict,
+                              required_outputs: Iterable[str]):
+    if (stage_dir / "stage.failed").exists() or (stage_dir / "stage.running").exists():
+        raise RuntimeError(f"Cannot reuse failed/incomplete scan stage {stage_dir}; use --force.")
+    if not (stage_dir / "stage.done").is_file():
+        raise RuntimeError(f"Scan stage {stage_dir} has outputs without stage.done; use --force.")
+    manifest = _read_json_dict(stage_dir / "stage_manifest.json", "scan stage manifest")
+    if manifest.get("status") != "completed" or not isinstance(manifest.get("configuration"), dict):
+        raise RuntimeError(f"Invalid completion manifest in {stage_dir}; use --force.")
+    if (manifest.get("returncode") != 0
+            or not isinstance(manifest.get("xtb_version"), str)
+            or not manifest["xtb_version"].strip()
+            or not isinstance(manifest.get("diagnostics"), dict)
+            or not isinstance(manifest.get("input_sha256"), dict)):
+        raise RuntimeError(f"Incomplete scan provenance in {stage_dir}; use --force.")
+    mismatches = configuration_mismatches(configuration, manifest["configuration"])
+    if mismatches:
+        raise RuntimeError(f"Cannot reuse {stage_dir}: changed {', '.join(mismatches)}; use --force.")
+    hashes = manifest.get("output_sha256")
+    if not isinstance(hashes, dict):
+        raise RuntimeError(f"Missing output hashes in {stage_dir}; use --force.")
+    for name in required_outputs:
+        if name not in hashes or not (stage_dir / name).is_file():
+            raise RuntimeError(f"Missing required scan output {stage_dir / name}; use --force.")
+    for name, digest in manifest["input_sha256"].items():
+        if not (stage_dir / name).is_file() or file_sha256(stage_dir / name) != digest:
+            raise RuntimeError(f"Scan input hash mismatch: {stage_dir / name}; use --force.")
+    for name, digest in hashes.items():
+        if not (stage_dir / name).is_file() or file_sha256(stage_dir / name) != digest:
+            raise RuntimeError(f"Scan output hash mismatch: {stage_dir / name}; use --force.")
+    return manifest
+
+
+def iter_xtbscan_frames(path: Path, expected_elements: list[str]):
+    """Read native xTB XMol frames; only exact energy comments are accepted."""
+    with path.open(errors="replace") as handle:
+        point = 0
+        while True:
+            header = handle.readline()
+            if not header:
+                return
+            if not header.strip():
+                continue
+            point += 1
+            try:
+                n_atoms = int(header.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid xtbscan.log frame header at point {point}.") from exc
+            if n_atoms != len(expected_elements):
+                raise ValueError(f"xtbscan.log point {point} has {n_atoms} atoms; expected {len(expected_elements)}.")
+            comment = handle.readline()
+            if not comment:
+                raise ValueError(f"Truncated xtbscan.log comment at point {point}.")
+            number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
+            match = re.fullmatch(
+                rf"\s*(?:SCF\s+done|energy\s*:)\s*({number})\s*",
+                comment, flags=re.IGNORECASE,
+            )
+            energy = float(match.group(1).replace("D", "E").replace("d", "e")) if match else None
+            if energy is not None and not math.isfinite(energy):
+                raise ValueError(f"Non-finite xtbscan.log energy at point {point}.")
+            elements, xyz = [], []
+            for _ in range(n_atoms):
+                record = handle.readline()
+                fields = record.split()
+                if len(fields) != 4:
+                    raise ValueError(f"Invalid xtbscan.log coordinate record at point {point}.")
+                elements.append(_normalize_element_symbol(fields[0]))
+                try:
+                    coords = tuple(float(value.replace("D", "E")) for value in fields[1:])
+                except ValueError as exc:
+                    raise ValueError(f"Invalid xtbscan.log coordinates at point {point}.") from exc
+                if any(not math.isfinite(value) for value in coords):
+                    raise ValueError(f"Non-finite xtbscan.log coordinates at point {point}.")
+                xyz.append(coords)
+            if elements != expected_elements:
+                raise ValueError(f"xtbscan.log element order mismatch at point {point}.")
+            yield {"point_index": point, "elements": elements, "xyz": xyz,
+                   "energy_Eh": energy, "comment": comment.strip()}
+
+
+def parse_xtbscan_log(path: Path, elements: list[str], coordinate: ScanCoordinate,
+                      frames=None):
+    frames = list(iter_xtbscan_frames(path, elements)) if frames is None else frames
+    if len(frames) != coordinate.n_points:
+        raise ValueError(
+            f"xtbscan.log has {len(frames)} frames; native xTB scan documentation "
+            f"describes {coordinate.n_points} optimized structures for "
+            f"{coordinate.n_points} requested steps. Target mapping withheld."
+        )
+    if any(frame["energy_Eh"] is None for frame in frames):
+        raise ValueError("At least one xtbscan.log energy comment is missing or ambiguous.")
+    first_energy = frames[0]["energy_Eh"]
+    minimum_energy = min(frame["energy_Eh"] for frame in frames)
+    rows = []
+    for index, frame in enumerate(frames):
+        target = coordinate.resolved_start_A + index * (
+            coordinate.end_A - coordinate.resolved_start_A
+        ) / (coordinate.n_points - 1)
+        actual = distance_A(
+            frame["xyz"][coordinate.atom_i - 1],
+            frame["xyz"][coordinate.atom_j - 1],
+        )
+        energy = frame["energy_Eh"]
+        rows.append({
+            "point_index": index + 1,
+            "target_coordinate_A": target,
+            "actual_coordinate_A": actual,
+            "coordinate_deviation_A": actual - target,
+            "energy_Eh": energy,
+            "deltaE_from_first_kcal_mol": (energy - first_energy) * HARTREE_TO_KCAL_MOL,
+            "deltaE_from_minimum_kcal_mol": (energy - minimum_energy) * HARTREE_TO_KCAL_MOL,
+            "xyz_file": f"points/point_{index + 1:04d}.xyz",
+            "pdb_file": None,
+        })
+    return frames, rows
+
+
+def write_unmapped_scan_frames(stage_dir: Path, frames, coordinate: ScanCoordinate):
+    """Preserve valid XMol geometries when target mapping or energy validation fails."""
+    points = stage_dir / "points"
+    points.mkdir(exist_ok=True)
+    names = []
+    for frame in frames:
+        actual = distance_A(
+            frame["xyz"][coordinate.atom_i - 1],
+            frame["xyz"][coordinate.atom_j - 1],
+        )
+        name = f"points/point_{frame['point_index']:04d}.xyz"
+        write_scan_xyz(
+            stage_dir / name, frame["elements"], frame["xyz"],
+            f"point={frame['point_index']} target_coordinate_A=unknown "
+            f"actual_coordinate_A={actual:.12f} "
+            f"energy_Eh={frame['energy_Eh'] if frame['energy_Eh'] is not None else 'unknown'}",
+        )
+        names.append(name)
+    return names
+
+
+SCAN_CSV_FIELDS = (
+    "point_index", "target_coordinate_A", "actual_coordinate_A",
+    "coordinate_deviation_A", "energy_Eh",
+    "deltaE_from_first_kcal_mol", "deltaE_from_minimum_kcal_mol",
+    "xyz_file", "pdb_file",
+)
+
+
+def write_scan_points(stage_dir: Path, frames, rows, topology: Path | None):
+    points_dir = stage_dir / "points"
+    points_dir.mkdir(exist_ok=True)
+    names = []
+    for frame, row in zip(frames, rows):
+        label = f"point_{row['point_index']:04d}"
+        xyz_path = points_dir / f"{label}.xyz"
+        write_scan_xyz(
+            xyz_path, frame["elements"], frame["xyz"],
+            f"point={row['point_index']} target_coordinate_A={row['target_coordinate_A']:.12f} "
+            f"actual_coordinate_A={row['actual_coordinate_A']:.12f} "
+            f"energy_Eh={row['energy_Eh']:.12f}",
+        )
+        names.append(f"points/{label}.xyz")
+        if topology is not None:
+            pdb_path = points_dir / f"{label}.pdb"
+            replace_pdb_coordinates(topology, frame["xyz"], pdb_path, frame["elements"])
+            row["pdb_file"] = f"points/{label}.pdb"
+            names.append(row["pdb_file"])
+    return names
+
+
+def write_scan_summary(stage_dir: Path, rows):
+    path = stage_dir / "scan_summary.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SCAN_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_scan_profile(stage_dir: Path, rows) -> bool:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+    except ImportError:
+        print("  WARNING matplotlib unavailable; scan_profile.png omitted.")
+        return False
+    fig, ax = plt.subplots()
+    try:
+        ax.plot(
+            [row["actual_coordinate_A"] for row in rows],
+            [row["deltaE_from_minimum_kcal_mol"] for row in rows],
+            marker="o",
+        )
+        ax.set_title("Relaxed constrained xTB scan")
+        ax.set_xlabel("Reaction coordinate (Å)")
+        ax.set_ylabel("Relative potential energy (kcal mol⁻¹)")
+        fig.tight_layout()
+        fig.savefig(stage_dir / "scan_profile.png", dpi=150)
+    finally:
+        plt.close(fig)
+    return True
+
+
+def scan_stage_command(args, input_name: str, xcontrol_name: str):
+    command = [
+        args.xtb, input_name, "--gfn", str(args.gfn), "--chrg", str(args.charge),
+        "--uhf", str(args.uhf), "--opt", args.scan_opt_level,
+        "--cycles", str(args.scan_opt_cycles), "--input", xcontrol_name,
+    ]
+    if args.alpb is not None:
+        command.extend(["--alpb", args.alpb])
+    return command
+
+
+def scan_stage_configuration(root_configuration: dict, stage: str,
+                             input_sha256: str, xcontrol_sha256: str) -> dict:
+    return {
+        "workflow_version": "1", "stage": stage,
+        "scan_configuration": root_configuration,
+        "input_geometry_sha256": input_sha256,
+        "xcontrol_sha256": xcontrol_sha256,
+    }
+
+
+def validate_scan_geometry(path: Path, expected_elements, reference_xyz=None,
+                           fixed_atoms=()):
+    elements, xyz = validate_scan_source(path)
+    if elements != expected_elements:
+        raise ValueError(f"Optimized geometry composition/order differs: {path}")
+    if reference_xyz is not None:
+        for index in fixed_atoms:
+            displacement = distance_A(reference_xyz[index - 1], xyz[index - 1])
+            if displacement > SCAN_FIXED_TOLERANCE_A:
+                raise ValueError(
+                    f"Fixed atom {index} moved {displacement:.6f} Å; "
+                    f"tolerance {SCAN_FIXED_TOLERANCE_A} Å."
+                )
+    return xyz
+
+
+def run_scan_stage(stage_dir: Path, args, *, stage: str, input_path: Path,
+                   xcontrol_text: str, root_configuration: dict,
+                   elements, fixed_atoms, coordinate, topology):
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    input_hash = file_sha256(input_path)
+    xcontrol_hash = hashlib.sha256(xcontrol_text.encode()).hexdigest()
+    config = scan_stage_configuration(root_configuration, stage, input_hash, xcontrol_hash)
+    required = (
+        ["input.xyz", "preopt.inp", "preopt.out", "optimized.xyz"]
+        if stage == "01_preopt" else
+        ["input.xyz", "scan.inp", "scan.out", "xtbscan.log", "scan_summary.csv"]
+    )
+    if any((stage_dir / marker).exists()
+           for marker in ("stage.done", "stage.failed", "stage.running")):
+        completed = validate_scan_stage_reuse(stage_dir, config, required)
+        if stage == "01_preopt":
+            if completed["diagnostics"].get("converged") is not True:
+                raise RuntimeError("Preoptimization convergence is not certified; use --force.")
+            reference = validate_scan_geometry(stage_dir / "input.xyz", elements)
+            validate_scan_geometry(stage_dir / "optimized.xyz", elements,
+                                   reference, fixed_atoms)
+        else:
+            if completed.get("frames_observed") != coordinate.n_points:
+                raise RuntimeError("Scan frame count missing or incompatible; use --force.")
+            frame_names = {
+                f"points/point_{index:04d}.{extension}"
+                for index in range(1, coordinate.n_points + 1)
+                for extension in (("xyz", "pdb") if topology else ("xyz",))
+            }
+            if not frame_names.issubset(completed["output_sha256"]):
+                raise RuntimeError("Scan point hashes are incomplete; use --force.")
+            frames, _ = parse_xtbscan_log(stage_dir / "xtbscan.log", elements,
+                                          coordinate)
+            reference = validate_scan_geometry(stage_dir / "input.xyz", elements)
+            for frame in frames:
+                for index in fixed_atoms:
+                    if distance_A(reference[index - 1], frame["xyz"][index - 1]) > SCAN_FIXED_TOLERANCE_A:
+                        raise RuntimeError("Fixed atoms moved in completed scan; use --force.")
+        print(f"  REUSE {stage_dir}")
+        return completed
+    prepared_names = {"input.xyz", "preopt.inp", "scan.inp"}
+    unexpected = [path.name for path in _co2_stage_active_entries(stage_dir)
+                  if path.name not in prepared_names]
+    if unexpected:
+        raise RuntimeError(
+            f"Uncertified files in {stage_dir}: {', '.join(unexpected)}; use --force."
+        )
+    input_copy = stage_dir / "input.xyz"
+    ensure_scan_input(input_copy, input_path.read_bytes())
+    inp_name = "preopt.inp" if stage == "01_preopt" else "scan.inp"
+    log_name = "preopt.out" if stage == "01_preopt" else "scan.out"
+    ensure_scan_input(stage_dir / inp_name, xcontrol_text.encode())
+    command = scan_stage_command(args, "input.xyz", inp_name)
+    runtime = {
+        "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None, "hostname": socket.gethostname(),
+        "command": command, "configuration": config,
+        "input_sha256": {"input.xyz": file_sha256(input_copy),
+                          inp_name: file_sha256(stage_dir / inp_name)},
+        "execution_resources": {"threads": args.threads},
+        "scientific_note": SCAN_WORKFLOW_NOTE,
+    }
+    _write_json(stage_dir / "stage_manifest.json", runtime)
+    mark_stage_running(stage_dir, runtime)
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(args.threads)
+    env["MKL_NUM_THREADS"] = str(args.threads)
+    env.setdefault("OMP_STACKSIZE", "4G")
+    returncode = None
+    diagnostics = {}
+    output_names = ["input.xyz", inp_name, log_name]
+    try:
+        with (stage_dir / log_name).open("w") as log:
+            result = subprocess.run(command, cwd=stage_dir, stdout=log,
+                                    stderr=subprocess.STDOUT, env=env, text=True)
+        returncode = result.returncode
+        if returncode != 0:
+            raise RuntimeError(f"xTB returned code {returncode}.")
+        log_text = (stage_dir / log_name).read_text(errors="replace")
+        for pattern in SCAN_FATAL_PATTERNS:
+            if pattern.lower() in log_text.lower():
+                raise RuntimeError(f"Fatal xTB pattern detected: {pattern}.")
+        if stage == "01_preopt":
+            xtbopt = stage_dir / "xtbopt.xyz"
+            if not xtbopt.is_file():
+                raise RuntimeError("xTB did not produce xtbopt.xyz.")
+            reference = validate_scan_geometry(input_copy, elements)
+            validate_scan_geometry(xtbopt, elements, reference, fixed_atoms)
+            shutil.copyfile(xtbopt, stage_dir / "optimized.xyz")
+            diagnostics = relaxation_diagnostics(
+                stage_dir / log_name, (stage_dir / "NOT_CONVERGED").exists()
+            )
+            if diagnostics["converged"] is not True:
+                raise RuntimeError(
+                    f"Preoptimization convergence is {diagnostics['converged']!r}; "
+                    "scan will not continue."
+                )
+            output_names.extend(["xtbopt.xyz", "optimized.xyz"])
+        else:
+            scan_log = stage_dir / "xtbscan.log"
+            if not scan_log.is_file():
+                raise RuntimeError("xTB did not produce xtbscan.log.")
+            frames = list(iter_xtbscan_frames(scan_log, elements))
+            diagnostics = {"frames_observed": len(frames),
+                           "energy_comment_format": "SCF done or energy:",
+                           "target_mapping": "N native XMol frames for N requested steps"}
+            output_names.extend(["xtbscan.log", *write_unmapped_scan_frames(
+                stage_dir, frames, coordinate
+            )])
+            frames, rows = parse_xtbscan_log(scan_log, elements, coordinate, frames)
+            # A fixed-region failure is a workflow failure even if xTB exits zero.
+            reference = validate_scan_geometry(input_copy, elements)
+            for frame in frames:
+                for index in fixed_atoms:
+                    if distance_A(reference[index - 1], frame["xyz"][index - 1]) > SCAN_FIXED_TOLERANCE_A:
+                        raise ValueError(f"Fixed atom {index} moved in scan point {frame['point_index']}.")
+            point_names = write_scan_points(stage_dir, frames, rows, topology)
+            write_scan_summary(stage_dir, rows)
+            plotted = plot_scan_profile(stage_dir, rows)
+            output_names.extend(["scan_summary.csv", *point_names])
+            output_names = list(dict.fromkeys(output_names))
+            if plotted:
+                output_names.append("scan_profile.png")
+        version = extract_xtb_version(
+            stage_dir / log_name,
+            stage_dir / ("optimized.xyz" if stage == "01_preopt" else "xtbscan.log"),
+        )
+        if version is None:
+            raise RuntimeError("xTB version could not be identified from stage outputs.")
+        completed = {
+            **runtime, "status": "completed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": returncode,
+            "xtb_version": version,
+            "diagnostics": diagnostics,
+            "frames_observed": diagnostics.get("frames_observed"),
+            "output_sha256": {
+                **scan_active_file_hashes(stage_dir),
+                **scan_output_hashes(stage_dir, output_names),
+            },
+        }
+        _write_json(stage_dir / "stage_manifest.json", completed)
+        mark_stage_done(stage_dir)
+        print(f"  OK {stage_dir}")
+        return completed
+    except (OSError, RuntimeError, ValueError) as exc:
+        failure = {
+            **runtime, "status": "failed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": returncode,
+            "xtb_version": extract_xtb_version(stage_dir / log_name,
+                                               stage_dir / "xtbscan.log"),
+            "diagnostics": diagnostics, "failure_reason": str(exc),
+            "output_sha256": scan_active_file_hashes(stage_dir),
+        }
+        _write_json(stage_dir / "stage_manifest.json", failure)
+        mark_stage_failed(stage_dir, str(exc))
+        raise RuntimeError(f"{stage} failed in {stage_dir}: {exc}") from exc
+
+
+def prepare_scan_condition(args):
+    source = args.scan_source.resolve()
+    elements, xyz = validate_scan_source(source)
+    source_bytes = source.read_bytes()
+    coordinate = parse_scan_coordinate(args.scan_coordinate, xyz)
+    topology = args.scan_topology.resolve() if args.scan_topology else None
+    topology_lines = topology_atoms = None
+    if topology is not None:
+        topology_lines, topology_atoms = validate_scan_topology(topology, elements)
+    topology_bytes = topology.read_bytes() if topology else None
+    n_atoms = len(elements)
+    fixed = set(parse_atom_ranges(args.scan_fix_atoms, n_atoms))
+    fixed_waters = mobile_waters = 0
+    if args.scan_mobile_radius is not None:
+        if args.scan_center_atom < 1 or args.scan_center_atom > n_atoms:
+            raise ValueError(f"--scan-center-atom must lie in 1-{n_atoms}.")
+        waters_fixed, fixed_waters, mobile_waters = scan_fixed_atoms_from_mobile_radius(
+            topology_lines, topology_atoms, xyz,
+            args.scan_center_atom, args.scan_mobile_radius,
+        )
+        fixed.update(waters_fixed)
+    fixed = sorted(fixed)
+    if coordinate.atom_i in fixed or coordinate.atom_j in fixed:
+        raise ValueError("A reaction-coordinate atom is fixed; choose a different selection.")
+    prepared_xyz, wall = prepare_scan_geometry(
+        elements, xyz, args.scan_wall_auto, args.scan_wall_margin
+    )
+    fixed_region = {
+        "fixed_atoms": fixed,
+        "fixed_atom_ranges": compress_atom_ranges(fixed),
+        "n_fixed_atoms": len(fixed), "n_mobile_atoms": n_atoms - len(fixed),
+        "mobile_radius_A": args.scan_mobile_radius,
+        "center_atom_index": args.scan_center_atom,
+        "fixed_waters": fixed_waters,
+        "mobile_waters": mobile_waters,
+        "number_of_fixed_waters": fixed_waters,
+        "number_of_mobile_waters": mobile_waters,
+    }
+    reaction = {
+        "type": "distance", "atoms_1based": [coordinate.atom_i, coordinate.atom_j],
+        "requested_start": coordinate.requested_start,
+        "resolved_start_A": coordinate.resolved_start_A,
+        "end_A": coordinate.end_A, "n_points": coordinate.n_points,
+        "force_constant": args.scan_force_constant,
+    }
+    preoptimization = {
+        "enabled": not args.scan_skip_preopt,
+        "status": "planned" if not args.scan_skip_preopt else "skipped",
+        "level": args.scan_opt_level, "cycles": args.scan_opt_cycles,
+        "engine": args.scan_opt_engine,
+    }
+    source_record = {
+        "path": str(source), "sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "n_atoms": n_atoms, "element_sequence": elements,
+    }
+    topology_record = (
+        {"path": str(topology), "sha256": hashlib.sha256(topology_bytes).hexdigest()}
+        if topology else {"path": None, "sha256": None}
+    )
+    xtb_record = {
+        "gfn": args.gfn, "charge": args.charge, "uhf": args.uhf,
+        "alpb": args.alpb, "threads": args.threads,
+    }
+    configuration = {
+        "source_sha256": source_record["sha256"],
+        "topology_sha256": topology_record["sha256"],
+        "element_sequence": elements, "xtb": {key: value for key, value in xtb_record.items()
+                                            if key != "threads"},
+        "reaction_coordinate": reaction,
+        "preoptimization": {key: value for key, value in preoptimization.items()
+                            if key != "status"},
+        "fixed_region": fixed_region, "wall": wall,
+    }
+    condition = (
+        args.scan_project.resolve() / scan_condition_name(source.stem)
+        / scan_condition_name(args.scan_label)
+    )
+    root_manifest_path = condition / "manifest.json"
+    previous = None
+    if root_manifest_path.is_file():
+        previous = _read_json_dict(root_manifest_path, "reaction-scan manifest")
+        recorded = previous.get("configuration")
+        if not isinstance(recorded, dict):
+            raise RuntimeError(f"Reaction-scan manifest lacks configuration: {root_manifest_path}")
+        mismatches = configuration_mismatches(configuration, recorded)
+        if mismatches and not args.force:
+            raise RuntimeError(
+                f"Existing scan condition differs in {', '.join(mismatches)}; "
+                "use --force to archive prior attempts."
+            )
+    elif condition.exists() and any(condition.iterdir()) and not args.force:
+        raise RuntimeError(f"Unproven scan condition {condition}; use --force to archive it.")
+    changed = previous is not None and configuration_mismatches(
+        configuration, previous["configuration"]
+    )
+    if args.force:
+        for name in ("01_preopt", "02_scan_forward"):
+            archive_co2_stage_attempt(condition / name, "Reaction scan --force rerun")
+        prep_archive = archive_co2_stage_attempt(
+            condition / "00_prepare", "Reaction scan --force preparation"
+        )
+        if root_manifest_path.is_file():
+            if prep_archive is None:
+                prep_archive = condition / "00_prepare" / "attempts" / (
+                    datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                )
+                prep_archive.mkdir(parents=True)
+            shutil.move(str(root_manifest_path), prep_archive / "root_manifest.json")
+    prep = condition / "00_prepare"
+    prep.mkdir(parents=True, exist_ok=True)
+    source_copy = prep / "source.xyz"
+    prepared_path = prep / "prepared.xyz"
+    topology_copy = prep / "topology.pdb" if topology else None
+    if previous is None or changed or args.force:
+        source_copy.write_bytes(source_bytes)
+        if args.scan_wall_auto:
+            write_scan_xyz(prepared_path, elements, prepared_xyz, "Translated to center of mass")
+        else:
+            prepared_path.write_bytes(source_bytes)
+        if topology:
+            topology_copy.write_bytes(topology_bytes)
+    else:
+        plan_path = prep / "scan_plan.json"
+        if _read_json_dict(plan_path, "reaction scan plan") != previous:
+            raise RuntimeError(f"Scan plan differs from manifest: {plan_path}; use --force.")
+        checks = [
+            (source_copy, source_record["sha256"]),
+            (prepared_path, previous.get("input_sha256", {}).get("prepared.xyz")),
+        ]
+        if topology:
+            checks.append((topology_copy, topology_record["sha256"]))
+        for path, digest in checks:
+            if not path.is_file() or file_sha256(path) != digest:
+                raise RuntimeError(f"Prepared scan input hash mismatch: {path}; use --force.")
+    preopt_text = scan_xcontrol(
+        coordinate, args.scan_force_constant, fixed, wall, args.scan_opt_engine,
+        scan=False,
+    )
+    scan_text = scan_xcontrol(
+        coordinate, args.scan_force_constant, fixed, wall, args.scan_opt_engine,
+        scan=True,
+    )
+    preopt_dir = condition / "01_preopt"
+    scan_dir = condition / "02_scan_forward"
+    if not args.scan_skip_preopt:
+        preopt_dir.mkdir(exist_ok=True)
+        preopt_started = any((preopt_dir / name).exists() for name in
+                             ("stage.done", "stage.failed", "stage.running"))
+        if not preopt_started:
+            unexpected = [path.name for path in _co2_stage_active_entries(preopt_dir)
+                          if path.name not in {"input.xyz", "preopt.inp"}]
+            if unexpected:
+                raise RuntimeError(f"Uncertified preopt files {unexpected}; use --force.")
+            ensure_scan_input(preopt_dir / "input.xyz", prepared_path.read_bytes())
+            ensure_scan_input(preopt_dir / "preopt.inp", preopt_text.encode())
+        else:
+            validate_existing_scan_input(preopt_dir / "input.xyz", prepared_path.read_bytes())
+            validate_existing_scan_input(preopt_dir / "preopt.inp", preopt_text.encode())
+    scan_dir.mkdir(exist_ok=True)
+    scan_started = any((scan_dir / name).exists() for name in
+                       ("stage.done", "stage.failed", "stage.running"))
+    if not scan_started:
+        unexpected = [path.name for path in _co2_stage_active_entries(scan_dir)
+                      if path.name not in {"input.xyz", "scan.inp"}]
+        if unexpected:
+            raise RuntimeError(f"Uncertified scan files {unexpected}; use --force.")
+        ensure_scan_input(scan_dir / "scan.inp", scan_text.encode())
+        if args.scan_skip_preopt:
+            ensure_scan_input(scan_dir / "input.xyz", prepared_path.read_bytes())
+    else:
+        validate_existing_scan_input(scan_dir / "scan.inp", scan_text.encode())
+        if args.scan_skip_preopt:
+            validate_existing_scan_input(scan_dir / "input.xyz", prepared_path.read_bytes())
+    input_hashes = {
+        "source.xyz": file_sha256(source_copy),
+        "prepared.xyz": file_sha256(prepared_path),
+        "scan.inp": file_sha256(scan_dir / "scan.inp"),
+    }
+    if not args.scan_skip_preopt:
+        input_hashes["preopt.inp"] = file_sha256(preopt_dir / "preopt.inp")
+    if topology:
+        input_hashes["topology.pdb"] = file_sha256(topology_copy)
+    manifest = {
+        "workflow": "relaxed_reaction_coordinate_scan", "workflow_version": "1",
+        "configuration": configuration, "source": source_record,
+        "topology": topology_record, "xtb": xtb_record,
+        "reaction_coordinate": reaction, "preoptimization": preoptimization,
+        "fixed_region": fixed_region, "wall": wall,
+        "input_sha256": input_hashes, "scientific_note": SCAN_WORKFLOW_NOTE,
+    }
+    _write_json(prep / "scan_plan.json", manifest)
+    _write_json(root_manifest_path, manifest)
+    print(f"Prepared reaction scan: {condition}")
+    print(f"  Initial distance: {coordinate.resolved_start_A:.6f} Å")
+    print(f"  Fixed atoms: {len(fixed)}; preoptimization: {preoptimization['status']}")
+    return condition, manifest, coordinate, elements, fixed, scan_text, preopt_text
+
+
+def run_reaction_scan_workflow(args):
+    condition, manifest, coordinate, elements, fixed, scan_text, preopt_text = (
+        prepare_scan_condition(args)
+    )
+    if not args.run:
+        print("Preparation only: xTB was not called. Inspect 00_prepare and inputs, then add --run.")
+        return
+    if shutil.which(args.xtb) is None:
+        raise RuntimeError(f"xTB executable {args.xtb!r} not found in PATH.")
+    prep = condition / "00_prepare"
+    prepared_path = prep / "prepared.xyz"
+    topology = prep / "topology.pdb" if args.scan_topology else None
+    config = manifest["configuration"]
+    if args.scan_skip_preopt:
+        scan_source = prepared_path
+    else:
+        preopt_dir = condition / "01_preopt"
+        run_scan_stage(
+            preopt_dir, args, stage="01_preopt", input_path=prepared_path,
+            xcontrol_text=preopt_text, root_configuration=config,
+            elements=elements, fixed_atoms=fixed, coordinate=coordinate,
+            topology=topology,
+        )
+        scan_source = preopt_dir / "optimized.xyz"
+    run_scan_stage(
+        condition / "02_scan_forward", args, stage="02_scan_forward",
+        input_path=scan_source, xcontrol_text=scan_text,
+        root_configuration=config, elements=elements, fixed_atoms=fixed,
+        coordinate=coordinate, topology=topology,
+    )
+    print(f"Reaction scan completed: {condition}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -7662,7 +8546,7 @@ def parse_args():
         description=(
             "Prepare spherical Packmol droplets and optionally run "
             "xTB MD E2 thermalization + screening, with an opt-in "
-            "20 ps continuation, or run the independent CO2 shell screen."
+            "20 ps continuation, or run independent CO2 and reaction scans."
         )
     )
 
@@ -7773,8 +8657,8 @@ def parse_args():
         "--run",
         action="store_true",
         help=(
-            "Run xTB after preparation. Without --run, only Packmol "
-            "packing + centering + input generation are performed."
+            "Run xTB after preparation. Without --run, prepare inputs only "
+            "(aqueous/CO2 modes may also run Packmol)."
         ),
     )
 
@@ -8130,6 +9014,45 @@ def parse_args():
         help="Validate predecessors and begin/reuse the selected CO2 stage.",
     )
 
+    scan = p.add_argument_group(
+        "independent relaxed reaction-coordinate scans",
+        "Prepare or run a 1D constrained distance scan from an arbitrary XYZ.",
+    )
+    scan.add_argument("--reaction-scan", action="store_true",
+                      help="Activate independent relaxed reaction-coordinate scanning.")
+    scan.add_argument("--scan-source", type=Path, metavar="FILE",
+                      help="Initial single-frame XYZ geometry (required).")
+    scan.add_argument("--scan-label", metavar="LABEL",
+                      help="Safe condition-directory label (required).")
+    scan.add_argument("--scan-project", type=Path, default=ROOT / "reaction_scans",
+                      metavar="DIR", help="Output project (default: ROOT/reaction_scans).")
+    scan.add_argument("--scan-coordinate", metavar="SPEC",
+                      help="V1: distance:I,J:START:END:N, 1-based atoms; START may be auto.")
+    scan.add_argument("--scan-force-constant", type=float, default=0.05,
+                      help="Native xTB constraint force constant (default: 0.05).")
+    scan.add_argument("--scan-opt-level", default="normal", choices=[
+        "crude", "sloppy", "loose", "lax", "normal", "tight", "vtight", "extreme",
+    ], help="xTB optimization level for preopt and scan (default: normal).")
+    scan.add_argument("--scan-opt-cycles", type=int, default=100,
+                      help="Maximum optimization cycles (default: 100).")
+    scan.add_argument("--scan-opt-engine", default="auto",
+                      choices=["auto", "rf", "lbfgs", "inertial"],
+                      help="Native xTB optimizer engine (default: auto).")
+    scan.add_argument("--scan-skip-preopt", action="store_true",
+                      help="Use prepared.xyz directly as scan input.")
+    scan.add_argument("--scan-fix-atoms", metavar="RANGES",
+                      help="Optional 1-based fixed atoms, e.g. 40-100,200.")
+    scan.add_argument("--scan-topology", type=Path, metavar="FILE",
+                      help="Optional atom-order-matched PDB topology for waters and outputs.")
+    scan.add_argument("--scan-mobile-radius", type=float, metavar="ANGSTROM",
+                      help="Fix whole waters whose O lies outside this radius.")
+    scan.add_argument("--scan-center-atom", type=int, metavar="INT",
+                      help="1-based center atom for mobile-water selection.")
+    scan.add_argument("--scan-wall-auto", action="store_true",
+                      help="Center source at COM and add a spherical log-Fermi wall.")
+    scan.add_argument("--scan-wall-margin", type=float, default=0.75,
+                      help="Wall radius beyond outermost centered atom in Å (default: 0.75).")
+
     return p.parse_args()
 
 
@@ -8156,6 +9079,51 @@ def select_systems(args):
 
 
 def validate_args(args):
+    explicit = {
+        token.split("=", 1)[0]
+        for token in sys.argv[1:] if token.startswith("--")
+    }
+    scan_options = {option for option in explicit if option.startswith("--scan-")}
+    if args.reaction_scan:
+        allowed = {
+            "--reaction-scan", "--run", "--force", "--xtb", "--threads",
+            "--gfn", "--charge", "--uhf", "--alpb", *scan_options,
+        }
+        irrelevant = sorted(explicit - allowed)
+        if irrelevant:
+            raise SystemExit(
+                "--reaction-scan cannot be combined with options from other "
+                "workflows: " + ", ".join(irrelevant)
+            )
+        if args.scan_source is None or args.scan_label is None or args.scan_coordinate is None:
+            raise SystemExit(
+                "--reaction-scan requires --scan-source, --scan-label, "
+                "and --scan-coordinate."
+            )
+        for option, value in (
+            ("--scan-force-constant", args.scan_force_constant),
+            ("--scan-wall-margin", args.scan_wall_margin),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise SystemExit(f"{option} must be finite and > 0.")
+        if args.scan_opt_cycles < 1:
+            raise SystemExit("--scan-opt-cycles must be >= 1.")
+        if args.threads < 1:
+            raise SystemExit("--threads must be >= 1.")
+        if args.scan_mobile_radius is not None:
+            if not math.isfinite(args.scan_mobile_radius) or args.scan_mobile_radius <= 0:
+                raise SystemExit("--scan-mobile-radius must be finite and > 0.")
+            if args.scan_topology is None or args.scan_center_atom is None:
+                raise SystemExit(
+                    "--scan-mobile-radius requires --scan-topology and --scan-center-atom."
+                )
+        elif args.scan_center_atom is not None:
+            raise SystemExit("--scan-center-atom requires --scan-mobile-radius.")
+        if args.force and not args.run:
+            raise SystemExit("Reaction-scan --force requires --run.")
+        return
+    if scan_options:
+        raise SystemExit("--scan-* options require --reaction-scan.")
     if args.thermostat_warning_policy != "allow":
         print(
             "WARNING: --thermostat-warning-policy "
@@ -8477,6 +9445,13 @@ def validate_args(args):
 def main():
     args = parse_args()
     validate_args(args)
+
+    if args.reaction_scan:
+        try:
+            run_reaction_scan_workflow(args)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return
 
     selected = select_systems(args)
     if args.co2_shell_screen:

@@ -197,6 +197,128 @@ only stage 05 while retaining stage 04, add `--force` to the stage-05 command.
 The preflight also validates the complete 01--04 chain, restart coordinates and
 velocities, composition, hashes, and a conservative free-disk estimate.
 
+## Relaxed reaction-coordinate scans
+
+`--reaction-scan` starts an independent analysis from one XYZ snapshot. It does
+not require `--system`, Packmol, or any aqueous/CO2 restart, and it is not a
+stage 11. V1 supports one forward, relaxed **distance** scan with 1-based atom
+indices and the pipeline's supported elements (H, C, N, O, Zn).
+`START=auto` is resolved from the supplied XYZ; the requested and
+resolved values are both stored. The XYZ supplies coordinates and atom order.
+An optional matching PDB supplies only residue metadata and output PDB records;
+atom count and element order must agree exactly.
+
+Prepare and inspect the inputs without invoking xTB:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --reaction-scan \
+    --scan-source subcluster_06_medoid_full.xyz \
+    --scan-topology subcluster_06_medoid_full.pdb \
+    --scan-label C6_Ow_CO2_attack \
+    --scan-coordinate "distance:352,701:auto:1.50:21" \
+    --scan-force-constant 0.05 \
+    --scan-mobile-radius 8.0 \
+    --scan-center-atom 20 \
+    --scan-wall-auto \
+    --scan-project reaction_scans \
+    --threads 8
+```
+
+The indices above are examples, never hardcoded. After inspection, run the same
+condition with `--run`:
+
+```bash
+python3 xtb_md_pipeline.py \
+    --reaction-scan \
+    --scan-source subcluster_06_medoid_full.xyz \
+    --scan-topology subcluster_06_medoid_full.pdb \
+    --scan-label C6_Ow_CO2_attack \
+    --scan-coordinate "distance:352,701:auto:1.50:21" \
+    --scan-force-constant 0.05 \
+    --scan-mobile-radius 8.0 \
+    --scan-center-atom 20 \
+    --scan-wall-auto \
+    --scan-project reaction_scans \
+    --threads 8 \
+    --run
+```
+
+`--scan-force-constant` is passed to xTB as its
+native `force constant` value; no unit is assigned here. The default
+optimization is `normal`, at most 100 cycles, with xTB's default engine.
+`--scan-opt-engine rf|lbfgs|inertial` writes an explicit `$opt` engine choice.
+GFN2-xTB, charge 0, UHF 0, and no ALPB remain the defaults; `--gfn`,
+`--charge`, `--uhf`, and `--alpb` can be supplied explicitly. `--xtb` and
+`--threads` control execution.
+
+Preoptimization is on by default. It uses the same distance restraint at the
+resolved START, fixed atoms, and wall as the subsequent scan, and must have an
+unambiguously converged geometry before the scan starts. Use
+`--scan-skip-preopt` to run directly from `prepared.xyz`; this is recorded as a
+skip, not a completed preoptimization. `--scan-fix-atoms "40-100,200"` fixes
+additional atoms. With `--scan-mobile-radius` and `--scan-center-atom`, waters
+whose oxygen lies outside the radius in the **original XYZ** are fixed as whole
+residues. Internal waters and non-water residues remain mobile by default.
+Fixing a reaction-coordinate atom is an error.
+
+There is no wall by default. `--scan-wall-auto` translates the XYZ to its center
+of mass, retains atom order and all internal distances, and creates a spherical
+log-Fermi wall at outermost-atom radius plus `--scan-wall-margin` (0.75 Å by
+default). `source.xyz` retains the exact supplied XYZ bytes;
+`prepared.xyz` contains the operational geometry. The translation and both wall
+radii are recorded.
+
+```text
+reaction_scans/<source_stem>/<scan_label>/
+├── manifest.json
+├── 00_prepare/
+│   ├── source.xyz
+│   ├── prepared.xyz
+│   ├── topology.pdb             # when supplied
+│   └── scan_plan.json
+├── 01_preopt/                   # omitted when skipped
+│   ├── input.xyz
+│   ├── preopt.inp
+│   ├── preopt.out               # after --run
+│   ├── optimized.xyz            # after --run
+│   ├── stage_manifest.json      # after --run
+│   └── stage.done/failed/running
+└── 02_scan_forward/
+    ├── input.xyz                # after preopt, or at preparation if skipped
+    ├── scan.inp
+    ├── scan.out                  # after --run
+    ├── xtbscan.log              # after --run
+    ├── stage_manifest.json      # after --run
+    ├── stage.done/failed/running
+    ├── scan_summary.csv         # after validated --run
+    ├── scan_profile.png         # if matplotlib is available
+    └── points/point_XXXX.xyz   # plus PDB with supplied topology
+```
+
+`scan_summary.csv` records the requested **target** distance and the **actual**
+distance recalculated from each optimized frame. Harmonic constraints can leave
+the actual value different from the target. Energies are taken only from
+unambiguous native XMol `xtbscan.log` comments. The plot uses actual distance
+and energy relative to the minimum scanned point. If matplotlib is unavailable,
+the CSV and stage can still be valid. The [official xTB scan guide](https://xtb-docs.readthedocs.io/en/latest/scan.html)
+documents `N` optimized XMol frames for `N` requested steps and the `SCF done`
+energy comment; the parser rejects a different frame count rather than guessing
+the target mapping. This implementation has not been checked against a real
+702-atom xTB 6.7.1 scan. The [xcontrol reference](https://github.com/grimme-lab/xtb/blob/main/man/xcontrol.7.adoc)
+documents the `$constrain`, `$scan`, `$opt`, and `$wall` forms used here.
+
+Successful stages are reused only with matching scientific configuration and
+output hashes. Changed inputs or a failed/incomplete stage require `--force
+--run`; previous stage contents move into their own `attempts/` directories.
+`--force` never deletes prior scan outputs. Thread count is execution
+provenance, not a scientific reuse condition.
+
+This is a **relaxed constrained potential-energy scan**. It is not a
+free-energy profile, kinetic barrier, transition-state search, converged
+reaction path, or minimum-energy path. Neither its maximum nor its shape alone
+justifies a ΔG‡ or rate constant.
+
 ## Independent CO2 shell screening
 
 `--co2-shell-screen` activates a separate workflow that starts from one
@@ -770,7 +892,9 @@ options and multi-stage examples.
 
 ## Scope boundary
 
-`xtb_md_pipeline.py` is deliberately limited to E2 preparation/screening.
+`xtb_md_pipeline.py` contains the E2 preparation/screening pipeline plus
+independent CO2 and reaction-scan workflows. The reaction scan is a derived
+potential-energy analysis, not an E2 MD extension.
 
 `xtb_analysis.py` consumes the stable directory layout without mixing simulation
 execution with analysis logic. More advanced analysis, clustering, and E2->E3/E4
